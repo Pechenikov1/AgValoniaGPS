@@ -122,10 +122,24 @@ public sealed class YouTurnPathingService
     }
 
     /// <summary>
-    /// True if the midpoint of the next pass (as determined by the normal turn rule — turnLeft XOR
-    /// sameWay — with no skip-worked adjustment) lies inside the cultivated area.
+    /// True if *any portion* of the next pass line (as determined by the normal turn rule —
+    /// turnLeft XOR sameWay — with no skip-worked adjustment) crosses the cultivated area.
     /// </summary>
-    public bool WouldNextLineBeInsideBoundary(
+    /// <remarks>
+    /// Fixes #289 F1. The previous implementation tested only the midpoint of the AB segment
+    /// offset perpendicular — for non-rectangular fields the AB midpoint is not the center of
+    /// every offset pass's usable span, so a midpoint can fall outside the polygon even when
+    /// the offset line still crosses the field somewhere along its 2000 m rendered extent.
+    /// That false-negative stopped U-turns early, leaving unworked strips on the far side of
+    /// non-rectangular fields. New implementation walks the full offset line at fixed spacing
+    /// and returns true if any sample lies inside the cultivated area.
+    /// </remarks>
+    /// <summary>
+    /// Check if the next pass line (in either direction) falls inside the cultivated area.
+    /// Returns (isInside, positiveDirection) where positiveDirection indicates which
+    /// offset direction has cultivated area.
+    /// </summary>
+    public (bool isInside, bool positiveDirection) WouldNextLineBeInsideBoundary(
         Models.Track.Track currentTrack,
         double abHeading,
         GuidanceWorkingState guidance,
@@ -134,14 +148,38 @@ public sealed class YouTurnPathingService
         int uTurnSkipRows)
     {
         if (boundary?.OuterBoundary == null || !boundary.OuterBoundary.IsValid)
-            return true;
+            return (true, false);
         if (currentTrack.Points.Count < 2)
-            return true;
+            return (true, false);
 
         var config = ConfigurationStore.Instance;
-        // Normal turn: turnLeft == sameWay so positiveOffset == false → path number decreases.
         int pathsToMove = uTurnSkipRows + 1;
-        int nextPathsAway = guidance.HowManyPathsAway - pathsToMove;
+        int nextPathsAwayNeg = guidance.HowManyPathsAway - pathsToMove;
+        int nextPathsAwayPos = guidance.HowManyPathsAway + pathsToMove;
+
+        bool negInside = CheckOffsetLineInsideCultivated(currentTrack, abHeading, nextPathsAwayNeg,
+                boundary, headlandLine, config);
+        bool posInside = CheckOffsetLineInsideCultivated(currentTrack, abHeading, nextPathsAwayPos,
+                boundary, headlandLine, config);
+
+        if (negInside && posInside)
+        {
+            // Both directions work — prefer the one that continues advancing
+            // (same direction as the current pass offset from 0).
+            // If on pass 0, prefer negative (original convention).
+            bool preferPositive = guidance.HowManyPathsAway > 0;
+            return (true, preferPositive);
+        }
+        if (negInside) return (true, false);
+        if (posInside) return (true, true);
+        return (false, false);
+    }
+
+    private bool CheckOffsetLineInsideCultivated(
+        Models.Track.Track currentTrack, double abHeading, int nextPathsAway,
+        Boundary? boundary, IReadOnlyList<Vec3>? headlandLine,
+        ConfigurationStore config)
+    {
 
         double widthMinusOverlap = config.ActualToolWidth - config.Tool.Overlap;
         double nextDistAway = widthMinusOverlap * nextPathsAway;
@@ -150,13 +188,46 @@ public sealed class YouTurnPathingService
         var pointB = currentTrack.Points[currentTrack.Points.Count - 1];
         double perpAngle = abHeading + Math.PI / 2;
 
+        // Sample the offset pass line along the AB direction across the full rendered extent
+        // (pass lines are drawn 2000 m beyond A and B in each direction — see
+        // DrawingContextMapControl.DrawSingleTrack). Spacing 5 m gives ~800 samples across a
+        // 4 km line — trivial cost, and won't miss a field whose narrowest usable span is > 5 m.
+        const double SampleSpacing = 5.0;
+        const double LineExtent = 2000.0;
+        double abDx = pointB.Easting - pointA.Easting;
+        double abDy = pointB.Northing - pointA.Northing;
+        double abLen = Math.Sqrt(abDx * abDx + abDy * abDy);
+        if (abLen < 0.01) return IsPointInsideCultivatedArea(
+            (pointA.Easting + pointB.Easting) / 2 + Math.Sin(perpAngle) * nextDistAway,
+            (pointA.Northing + pointB.Northing) / 2 + Math.Cos(perpAngle) * nextDistAway,
+            boundary, headlandLine);
+
+        double abNx = abDx / abLen;
+        double abNy = abDy / abLen;
+
         double midEasting = (pointA.Easting + pointB.Easting) / 2 + Math.Sin(perpAngle) * nextDistAway;
         double midNorthing = (pointA.Northing + pointB.Northing) / 2 + Math.Cos(perpAngle) * nextDistAway;
 
-        bool inside = IsPointInsideCultivatedArea(midEasting, midNorthing, boundary, headlandLine);
-        _logger.LogDebug("[NextTrack] currentPath={Cur}, nextPath={Next}, midpoint=({E:F1},{N:F1}) insideCultivated={Inside}",
-            guidance.HowManyPathsAway, nextPathsAway, midEasting, midNorthing, inside);
-        return inside;
+        double totalLength = abLen + 2 * LineExtent;
+        int sampleCount = (int)(totalLength / SampleSpacing);
+        double startOffset = -(totalLength / 2.0);
+
+        for (int i = 0; i <= sampleCount; i++)
+        {
+            double t = startOffset + i * SampleSpacing;
+            double e = midEasting + abNx * t;
+            double n = midNorthing + abNy * t;
+            if (IsPointInsideCultivatedArea(e, n, boundary, headlandLine))
+            {
+                _logger.LogDebug("[NextTrack] nextPath={Next}, sample at t={T:F0}m hit cultivated area",
+                    nextPathsAway, t);
+                return true;
+            }
+        }
+
+        _logger.LogDebug("[NextTrack] nextPath={Next}, no sample along {N} samples of offset line hit cultivated area",
+            nextPathsAway, sampleCount + 1);
+        return false;
     }
 
     /// <summary>

@@ -30,6 +30,10 @@ namespace AgValoniaGPS.Services.Pipeline;
 /// </summary>
 public sealed class GpsPipelineService : IGpsPipelineService
 {
+    // Lookahead time (seconds) used for auto-track-select in free-drive mode.
+    // Matches AgOpen's setAS_guidanceLookAheadTime default. See #261.
+    private const double GuidanceLookAheadSeconds = 2.0;
+
     // ── Dependencies ────────────────────────────────────────────────────
     private readonly IGpsService _gpsService;
     private readonly IToolPositionService _toolPositionService;
@@ -241,9 +245,24 @@ public sealed class GpsPipelineService : IGpsPipelineService
     // GPS event handler
     // ══════════════════════════════════════════════════════════════════════
 
+    /// <summary>
+    /// When true, ProcessCycle runs synchronously on the calling thread instead
+    /// of Task.Run. Eliminates async timing issues in tests: every GPS frame
+    /// produces its result before the next frame is sent.
+    /// </summary>
+    public bool SynchronousMode { get; set; }
+
     private void OnGpsDataUpdated(object? sender, GpsData data)
     {
-        // Skip if previous cycle is still running (back-pressure)
+        if (SynchronousMode)
+        {
+            // Test mode: process inline, no back-pressure, no threading
+            try { ProcessCycle(data); }
+            catch (Exception ex) { _logger.LogError(ex, "GpsPipelineService.ProcessCycle failed"); }
+            return;
+        }
+
+        // Production mode: Task.Run with single-cycle-in-flight back-pressure
         if (Interlocked.CompareExchange(ref _processing, 1, 0) != 0)
             return;
 
@@ -416,8 +435,45 @@ public sealed class GpsPipelineService : IGpsPipelineService
         // Stage 3 (Phase B C2): Heading fusion. Replaces the raw NMEA heading
         // with the dual-antenna-aware / fix-to-fix / IMU-blended value.
         // Receives real local easting/northing — see TMP-009 in the parking lot.
-        double fusedHeading = _headingFusion.FuseHeading(pos.Heading, pos.Speed, posEasting, posNorthing);
+        double fusedHeading = _headingFusion.FuseHeading(
+            pos.Heading, data.ImuHeading, data.ImuValid,
+            pos.Speed, posEasting, posNorthing);
         pos = pos with { Heading = fusedHeading };
+
+        // ── (1b) Antenna-to-pivot transform in local coordinates ────────
+        // GpsService.TransformAntennaToPivot cannot apply these because it
+        // runs before local plane conversion (E/N still 0). Apply here
+        // where E/N are valid local coordinates.
+        {
+            var vehicle = ConfigurationStore.Instance.Vehicle;
+            double hdgRad = pos.Heading * Math.PI / 180.0;
+
+            // Fore/aft offset (AntennaPivot)
+            if (Math.Abs(vehicle.AntennaPivot) > 0.001)
+            {
+                posEasting -= Math.Sin(hdgRad) * vehicle.AntennaPivot;
+                posNorthing -= Math.Cos(hdgRad) * vehicle.AntennaPivot;
+            }
+
+            // Lateral offset (AntennaOffset)
+            if (Math.Abs(vehicle.AntennaOffset) > 0.001)
+            {
+                double perpHeading = hdgRad + Math.PI / 2.0;
+                posEasting -= Math.Sin(perpHeading) * vehicle.AntennaOffset;
+                posNorthing -= Math.Cos(perpHeading) * vehicle.AntennaOffset;
+            }
+
+            // Roll correction (read from GpsData, not SensorState — Phase B
+            // removed NmeaParserService which was the only SensorState writer)
+            double imuRoll = data.ImuRoll;
+            if (Math.Abs(imuRoll) > 0.01 && Math.Abs(vehicle.AntennaHeight) > 0.01)
+            {
+                double rollRad = imuRoll * Math.PI / 180.0;
+                double rollDist = Math.Sin(rollRad) * -vehicle.AntennaHeight;
+                posEasting += Math.Cos(-hdgRad) * rollDist;
+                posNorthing += Math.Sin(-hdgRad) * rollDist;
+            }
+        }
 
         // ── (2) Apply drift compensation ────────────────────────────────
         double driftedEasting = posEasting + driftE;
@@ -495,7 +551,9 @@ public sealed class GpsPipelineService : IGpsPipelineService
         bool autoSteerDisengaged = false;
         string? disengageReason = null;
 
-        bool skipBoundaryCheck = (isTrackOnBoundary && passNumber == 0) || isInYouTurn;
+        // During U-turns the tractor may go slightly outside the headland but
+        // must NEVER leave the outer field boundary. Only skip for on-boundary pass 0.
+        bool skipBoundaryCheck = isTrackOnBoundary && passNumber == 0;
         if (autoSteerEngaged && !skipBoundaryCheck
             && !IsPointInsideBoundary(boundary, driftedEasting, driftedNorthing))
         {
@@ -546,7 +604,9 @@ public sealed class GpsPipelineService : IGpsPipelineService
             if (isYouTurnTriggered && youTurnPath != null && youTurnPath.Count > 0)
             {
                 // YouTurn guidance — steer along turn path
-                var ytResult = CalculateYouTurnGuidance(pos, youTurnPath);
+                // Use drifted local coordinates (not pos which has raw E=0,N=0)
+                var ytPos = pos with { Easting = driftedEasting, Northing = driftedNorthing };
+                var ytResult = CalculateYouTurnGuidance(ytPos, youTurnPath);
                 if (ytResult != null)
                 {
                     steerAngle = ytResult.Value.steerAngle;
@@ -589,8 +649,20 @@ public sealed class GpsPipelineService : IGpsPipelineService
             // through SyncGuidanceStateToPipeline — two writers fighting each
             // other and causing a per-cycle oscillation (see commit 57920e0).
             // One writer now — the cycle.
+            //
+            // #261: match AgOpen — project a *lookahead* point (pivot + heading * lookDist)
+            // onto the reference line instead of the raw pivot. Produces the "track jumps
+            // ahead of the tractor" behavior operators expect in free-drive.
+            double lookDist = Math.Max(
+                ConfigurationStore.Instance.ActualToolWidth * 0.5,
+                pos.Speed * GuidanceLookAheadSeconds);
+            double hRad = pos.Heading * Math.PI / 180.0;
+            double lookE = driftedEasting + Math.Sin(hRad) * lookDist;
+            double lookN = driftedNorthing + Math.Cos(hRad) * lookDist;
             var (nearestPass, nearestDisplayTrack) = UpdateDisplayTrack(
-                pos, track!, passNumber, nudgeOffset, driftedEasting, driftedNorthing);
+                pos, track!, passNumber, nudgeOffset,
+                driftedEasting, driftedNorthing,
+                lookE, lookN);
             if (nearestDisplayTrack != null)
             {
                 displayTrack = nearestDisplayTrack;
@@ -690,7 +762,7 @@ public sealed class GpsPipelineService : IGpsPipelineService
             Northing = driftedNorthing,
             Heading = pos.Heading,
             Speed = pos.Speed,
-            RollDegrees = SensorState.Instance.ImuRoll,
+            RollDegrees = data.ImuRoll,
             SatelliteCount = data.SatellitesInUse,
             FixQuality = data.FixQuality,
             GpsValid = data.IsValid,
@@ -829,6 +901,11 @@ public sealed class GpsPipelineService : IGpsPipelineService
         double widthMinusOverlap = config.ActualToolWidth - config.Tool.Overlap;
         double distAway = widthMinusOverlap * passNumber + nudgeOffset;
 
+        if (_cycleCounter % 50 == 0)
+        {
+            Console.WriteLine($"[Guidance] pass={passNumber} distAway={distAway:F1} pivot=({driftedEasting:F1},{driftedNorthing:F1}) h={headingRad*180/Math.PI:F1}");
+        }
+
         Models.Track.Track currentTrack;
         string? statusMessage = null;
 
@@ -862,6 +939,13 @@ public sealed class GpsPipelineService : IGpsPipelineService
                 IsVisible = true,
                 IsActive = true
             };
+        }
+
+        if (_cycleCounter % 50 == 0 && currentTrack.Points.Count >= 2)
+        {
+            var p0 = currentTrack.Points[0];
+            var pN = currentTrack.Points[^1];
+            Console.WriteLine($"[Guidance] track: ({p0.Easting:F1},{p0.Northing:F1})->({pN.Easting:F1},{pN.Northing:F1})");
         }
 
         // Calculate heading alignment using the offset track we're actually following
@@ -912,14 +996,23 @@ public sealed class GpsPipelineService : IGpsPipelineService
     /// </summary>
     private (int nearestPass, Models.Track.Track? displayTrack) UpdateDisplayTrack(
         Position pos, Models.Track.Track track, int passNumber, double nudgeOffset,
-        double driftedEasting, double driftedNorthing)
+        double pivotEasting, double pivotNorthing,
+        double sampleEasting, double sampleNorthing)
     {
         var config = ConfigurationStore.Instance;
         double widthMinusOverlap = config.ActualToolWidth - config.Tool.Overlap;
         if (widthMinusOverlap < 0.1) widthMinusOverlap = 1.0;
 
-        double perpDist = CalculatePerpendicularDistance(track, driftedEasting, driftedNorthing);
-        int nearestPass = (int)Math.Round(perpDist / widthMinusOverlap);
+        // Nearest-pass selection uses the *lookahead* sample (hysteresis: line jumps
+        // ahead of the tractor in free-drive). XTE display uses the *pivot* (actual
+        // cross-track error from the tractor position). See #261.
+        double sampleDist = CalculatePerpendicularDistance(track, sampleEasting, sampleNorthing);
+
+        // Match AgOpen CABLine.BuildCurrentABLineList — subtract the accumulated nudge
+        // before rounding to the nearest pass. Without this, nudging the line perpendicular
+        // can cause the auto-select to fight the nudge each cycle.
+        double refDist = (sampleDist - nudgeOffset) / widthMinusOverlap;
+        int nearestPass = refDist < 0 ? (int)(refDist - 0.5) : (int)(refDist + 0.5);
         double distAway = widthMinusOverlap * nearestPass + nudgeOffset;
 
         Models.Track.Track? resultTrack = null;
@@ -941,8 +1034,9 @@ public sealed class GpsPipelineService : IGpsPipelineService
             };
         }
 
-        // Update XTE display
-        double xte = perpDist - (nearestPass * widthMinusOverlap);
+        // Update XTE display — actual pivot distance to the selected pass line.
+        double pivotPerp = CalculatePerpendicularDistance(track, pivotEasting, pivotNorthing);
+        double xte = pivotPerp - distAway;
         if (track.Points.Count >= 2)
         {
             var a = track.Points[0];

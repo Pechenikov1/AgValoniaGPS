@@ -516,6 +516,9 @@ public partial class MainViewModel : ObservableObject
                 State.Connections.IsImuDataOk = imuOk;
                 State.Connections.IsGpsDataOk = gpsOk;
                 State.Connections.IsGpsConnected = gpsOk;
+                State.Connections.AutoSteerIpAddress = _udpService.GetModuleIpAddress(ModuleType.AutoSteer);
+                State.Connections.MachineIpAddress = _udpService.GetModuleIpAddress(ModuleType.Machine);
+                State.Connections.ImuIpAddress = _udpService.GetModuleIpAddress(ModuleType.IMU);
 
                 // Legacy property updates (for existing bindings - will be removed in Phase 5)
                 IsAutoSteerDataOk = steerOk;
@@ -2381,15 +2384,6 @@ public partial class MainViewModel : ObservableObject
     // AgShare Download Dialog (visibility managed by State.UI)
     public ICommand? CancelAgShareDownloadDialogCommand { get; private set; }
 
-    // Data I/O Commands
-    public ICommand? ShowDataIODialogCommand { get; private set; }
-    public ICommand? CloseDataIODialogCommand { get; private set; }
-
-    private void CloseDataIODialog()
-    {
-        State.UI.CloseDialog();
-    }
-
     // iOS Modal Sheet Visibility Properties
     private bool _isFileMenuVisible;
     public bool IsFileMenuVisible
@@ -3608,12 +3602,13 @@ public partial class MainViewModel : ObservableObject
         }
         else
         {
-            State.Field.HeadlandLine = null;
-            _currentHeadlandLine = null;
-            _mapService.SetHeadlandLine(null);
-            HasHeadland = false;
-            IsHeadlandOn = false;
-            _logger.LogDebug($"[Headland] No valid HeadlandPolygon - YouTurn headland detection disabled");
+            // Boundary didn't carry a HeadlandPolygon (field.geojson has no headland role).
+            // DO NOT clobber State.Field.HeadlandLine here — the legacy Headlines.txt
+            // loader (LoadHeadland) runs separately on field open and is the authoritative
+            // source for the legacy-format case. Nulling it here races with that loader
+            // and silently disables U-turn headland detection (#289 F3). Field close and
+            // explicit headland removal handle the reset case elsewhere.
+            _logger.LogDebug($"[Headland] Boundary has no HeadlandPolygon — deferring to LoadHeadland / existing state");
         }
 
         // Sync boundary + headland to pipeline for guidance computations
