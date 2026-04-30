@@ -68,6 +68,8 @@ public partial class MainViewModel : ObservableObject
     private readonly IVehicleProfileService _vehicleProfileService;
     private readonly IConfigurationService _configurationService;
     private readonly IAutoSteerService _autoSteerService;
+    private readonly ISmartWasCalibrationService _smartWasService;
+    private readonly ITrackCopierService _trackCopierService;
     private readonly IModuleCommunicationService _moduleCommunicationService;
     private readonly IToolPositionService _toolPositionService;
     private readonly ICoverageMapService _coverageMapService;
@@ -147,7 +149,6 @@ public partial class MainViewModel : ObservableObject
     private bool _isMachineDataOk;
     private bool _isImuDataOk;
     private bool _isGpsDataOk;
-    private string _debugLog = "";
 
     // Tool position (for rendering)
     private double _toolEasting;
@@ -184,6 +185,8 @@ public partial class MainViewModel : ObservableObject
         IVehicleProfileService vehicleProfileService,
         IConfigurationService configurationService,
         IAutoSteerService autoSteerService,
+        ISmartWasCalibrationService smartWasService,
+        ITrackCopierService trackCopierService,
         IModuleCommunicationService moduleCommunicationService,
         IToolPositionService toolPositionService,
         ICoverageMapService coverageMapService,
@@ -239,6 +242,8 @@ public partial class MainViewModel : ObservableObject
         _vehicleProfileService = vehicleProfileService;
         _configurationService = configurationService;
         _autoSteerService = autoSteerService;
+        _smartWasService = smartWasService;
+        _trackCopierService = trackCopierService;
         _moduleCommunicationService = moduleCommunicationService;
         _toolPositionService = toolPositionService;
         _coverageMapService = coverageMapService;
@@ -254,9 +259,9 @@ public partial class MainViewModel : ObservableObject
 
         // Subscribe to events
         _gpsService.GpsDataUpdated += OnGpsDataUpdated;
-        _udpService.DataReceived += OnUdpDataReceived;
         _autoSteerService.StateUpdated += OnAutoSteerStateUpdated;
         (_autoSteerService as Services.AutoSteer.AutoSteerService)?.SetTramLineService(_tramLineService);
+        (_autoSteerService as Services.AutoSteer.AutoSteerService)?.SetSmartWasService(_smartWasService);
         _autoSteerService.Start(); // Enable zero-copy GPS pipeline
 
         // Start the background GPS processing pipeline
@@ -272,7 +277,6 @@ public partial class MainViewModel : ObservableObject
         _boundaryRecordingService.StateChanged += OnBoundaryStateChanged;
         _moduleCommunicationService.AutoSteerToggleRequested += OnAutoSteerToggleRequested;
         _moduleCommunicationService.SectionMasterToggleRequested += OnSectionMasterToggleRequested;
-        _toolPositionService.PositionUpdated += OnToolPositionUpdated;
         _sectionControlService.SectionStateChanged += OnSectionStateChanged;
         _coverageMapService.BoundsExpanded += OnCoverageBoundsExpanded;
 
@@ -724,12 +728,6 @@ public partial class MainViewModel : ObservableObject
 
     // NTRIP properties are in MainViewModel.Ntrip.cs
 
-    public string DebugLog
-    {
-        get => _debugLog;
-        set => SetProperty(ref _debugLog, value);
-    }
-
     // Tool position properties (for map rendering)
     public double ToolEasting
     {
@@ -771,167 +769,6 @@ public partial class MainViewModel : ObservableObject
 
     // OnAutoSteerStateUpdated is now in MainViewModel.Guidance.cs
 
-    private void OnToolPositionUpdated(object? sender, Services.Interfaces.ToolPositionUpdatedEventArgs e)
-    {
-        // Update tool position properties for map rendering
-        // This fires after each GPS update when ToolPositionService.Update() is called
-        if (Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
-        {
-            UpdateToolPositionProperties(e);
-        }
-        else
-        {
-            Avalonia.Threading.Dispatcher.UIThread.Post(() => UpdateToolPositionProperties(e));
-        }
-    }
-
-    // Timing instrumentation for performance profiling
-    private static readonly Stopwatch _updateSw = new();
-    private static double _lastSectionControlMs;
-    private static double _lastCoveragePaintingMs;
-    private static double _lastPropertyUpdateMs;
-    private static int _updateCounter;
-
-    private void UpdateToolPositionProperties(Services.Interfaces.ToolPositionUpdatedEventArgs e)
-    {
-        _updateSw.Restart();
-
-        var config = Models.Configuration.ConfigurationStore.Instance;
-
-        // Calculate actual tool width from active sections (section widths are in cm)
-        double totalWidthMeters = 0;
-        int numSections = config.NumSections;
-        for (int i = 0; i < numSections && i < 16; i++)
-        {
-            totalWidthMeters += config.Tool.GetSectionWidth(i) / 100.0; // cm to meters
-        }
-
-        // Get hitch position from the service
-        var hitchPos = _toolPositionService.HitchPosition;
-
-        // Set all properties BEFORE ToolEasting (which triggers the view update)
-        ToolNorthing = e.ToolPosition.Northing;
-        ToolHeadingRadians = e.ToolHeading;
-        ToolWidth = totalWidthMeters; // Use calculated width from sections
-        HitchEasting = hitchPos.Easting;
-        HitchNorthing = hitchPos.Northing;
-
-        double propsTime = _updateSw.Elapsed.TotalMilliseconds;
-
-        // Update section control - determines which sections should be on/off in Auto mode
-        _updateSw.Restart();
-        _sectionControlService.Update(e.ToolPosition, e.ToolHeading, e.VehicleHeading, Speed);
-        _lastSectionControlMs = _updateSw.Elapsed.TotalMilliseconds;
-
-        // Calculate hydraulic lift state based on tool position vs headland
-        byte hydLiftState = CalculateHydLiftState(e.ToolPosition, Speed);
-
-        // Push section bits + u-turn state + hydraulic lift to AutoSteerService for PGN 239
-        _autoSteerService.SetMachineState(_sectionControlService.GetSectionBits(), State.YouTurn.IsExecuting, hydLiftState);
-
-        // Update coverage painting - paint when sections are active and moving
-        _updateSw.Restart();
-        UpdateCoveragePainting(e.ToolPosition, e.ToolHeading);
-        _lastCoveragePaintingMs = _updateSw.Elapsed.TotalMilliseconds;
-
-        // Set ToolEasting LAST - this triggers the PropertyChanged that updates the map
-        _updateSw.Restart();
-        ToolEasting = e.ToolPosition.Easting;
-        _lastPropertyUpdateMs = _updateSw.Elapsed.TotalMilliseconds;
-
-        // Log every 30 updates (~1 second at 30 Hz GPS) - single line for easy filtering
-        if (++_updateCounter % 30 == 0)
-        {
-            Debug.WriteLine($"[Timing] SectionCtrl: {_lastSectionControlMs:F2}ms (Bnd:{Services.Section.SectionControlService.LastBoundaryMs:F2} Hdl:{Services.Section.SectionControlService.LastHeadlandMs:F2} Cov:{Services.Section.SectionControlService.LastCoverageCheckMs:F2}) | Paint: {_lastCoveragePaintingMs:F2}ms | Props: {_lastPropertyUpdateMs:F2}ms");
-        }
-    }
-
-    /// <summary>
-    /// Calculate hydraulic lift state: raise in headland, lower in cultivated area.
-    /// Matches legacy AgOpenGPS CHead.SetHydPosition() logic.
-    /// PGN 239 values: 0=off, 1=lower(down), 2=raise(up)
-    /// </summary>
-    private byte CalculateHydLiftState(Models.Base.Vec3 toolPosition, double speed)
-    {
-        var machine = Models.Configuration.ConfigurationStore.Instance.Machine;
-        if (!machine.HydraulicLiftEnabled) return 0;
-
-        // Don't operate at very low speed or in reverse
-        if (speed < 0.2 || IsReversing) return 0;
-
-        // Check if tool is in headland zone (between outer boundary and headland line)
-        var headlandLine = State.Field.HeadlandLine;
-        if (headlandLine == null || headlandLine.Count < 3) return 0;
-
-        var boundary = State.Field.CurrentBoundary;
-        if (boundary == null || !boundary.IsValid) return 0;
-
-        bool inBoundary = boundary.IsPointInside(toolPosition.Easting, toolPosition.Northing);
-        if (!inBoundary) return 0; // Outside field entirely
-
-        bool inCultivatedArea = Models.Base.GeometryMath.IsPointInPolygon(
-            headlandLine, new Models.Base.Vec2(toolPosition.Easting, toolPosition.Northing));
-
-        // In headland (between boundary and headland line) = RAISE
-        // In cultivated area (inside headland line) = LOWER
-        return inCultivatedArea ? (byte)1 : (byte)2;
-    }
-
-    /// <summary>
-    /// Update coverage painting based on section states.
-    /// Paints triangle strips when sections are active and vehicle is moving.
-    /// </summary>
-    private void UpdateCoveragePainting(Vec3 toolPosition, double toolHeading)
-    {
-        // Minimum speed to paint coverage (0.3 m/s ≈ 1 km/h) - don't paint when stationary
-        const double MinPaintingSpeed = 0.3;
-        if (Speed < MinPaintingSpeed)
-        {
-            // Stop all mapping if vehicle is stationary
-            for (int i = 0; i < _sectionControlService.NumSections; i++)
-            {
-                if (_coverageMapService.IsZoneMapping(i))
-                {
-                    _coverageMapService.StopMapping(i);
-                }
-            }
-            return;
-        }
-
-        // Update each section's coverage based on its state
-        var states = _sectionControlService.SectionStates;
-        for (int i = 0; i < states.Count; i++)
-        {
-            var state = states[i];
-            var (left, right) = _sectionControlService.GetSectionWorldPosition(i, toolPosition, toolHeading);
-
-            if (state.IsOn && !_coverageMapService.IsZoneMapping(i))
-            {
-                // Section just turned on - start mapping
-                _coverageMapService.StartMapping(i, left, right);
-            }
-            else if (!state.IsOn && _coverageMapService.IsZoneMapping(i))
-            {
-                // Section just turned off - stop mapping
-                _coverageMapService.StopMapping(i);
-            }
-            else if (state.IsOn && _coverageMapService.IsZoneMapping(i))
-            {
-                // Section still on - add coverage point
-                _coverageMapService.AddCoveragePoint(i, left, right);
-            }
-        }
-
-        // Flush coverage updates after all sections processed (fires event once, not 16 times)
-        _coverageMapService.FlushCoverageUpdate();
-
-        // Record worked path for skip-and-fill mode (any section painting = path is worked)
-        if (states.Any(s => s.IsOn) && SelectedTrack != null)
-        {
-            SelectedTrack.MarkPathWorked(State.Guidance.HowManyPathsAway);
-        }
-    }
-
 
 
     // AutoSteer guidance state and event handlers
@@ -970,39 +807,6 @@ public partial class MainViewModel : ObservableObject
             // TODO: When separate Auto/Manual section buttons are implemented, handle them individually
             ToggleSectionMasterCommand?.Execute(null);
         });
-    }
-
-    private void OnUdpDataReceived(object? sender, UdpDataReceivedEventArgs e)
-    {
-        var now = DateTime.Now;
-        var packetAge = (now - e.Timestamp).TotalMilliseconds;
-
-        // Handle different message types.
-        // Phase B C3: NMEA packets (PGN == 0) are now handled by the zero-copy
-        // AutoSteerService.ProcessGpsBuffer path in UdpCommunicationService. The MVM
-        // handler only touches non-NMEA PGNs.
-        if (e.PGN != 0)
-        {
-            // Binary PGN message - log it with age to detect buffering
-            DebugLog = $"PGN: {e.PGN} (0x{e.PGN:X2}) @ {e.Timestamp:HH:mm:ss.fff} (age: {packetAge:F0}ms)";
-
-            switch (e.PGN)
-            {
-                case PgnNumbers.HELLO_FROM_AUTOSTEER:
-                    // AutoSteer module is alive
-                    break;
-
-                case PgnNumbers.HELLO_FROM_MACHINE:
-                    // Machine module is alive
-                    break;
-
-                case PgnNumbers.HELLO_FROM_IMU:
-                    // IMU module is alive
-                    break;
-
-                // TODO: Add more PGN handlers as needed
-            }
-        }
     }
 
     private void OnModuleConnectionChanged(object? sender, ModuleConnectionEventArgs e)
@@ -2592,9 +2396,19 @@ public partial class MainViewModel : ObservableObject
         set => SetProperty(ref _autoSteerConfigViewModel, value);
     }
 
+    // Smart WAS calibration dialog
+    private SmartWasViewModel? _smartWasViewModel;
+    public SmartWasViewModel? SmartWasViewModel
+    {
+        get => _smartWasViewModel;
+        set => SetProperty(ref _smartWasViewModel, value);
+    }
+
     public ICommand? ShowConfigurationDialogCommand { get; private set; }
     public ICommand? CancelConfigurationDialogCommand { get; private set; }
     public ICommand? ShowAutoSteerConfigCommand { get; private set; }
+    public ICommand? ShowSmartWasCommand { get; private set; }
+    public ICommand? CloseSmartWasDialogCommand { get; private set; }
     public ICommand? ShowLoadProfileDialogCommand { get; private set; }
     public ICommand? ShowNewProfileDialogCommand { get; private set; }
     public ICommand? LoadSelectedProfileCommand { get; private set; }

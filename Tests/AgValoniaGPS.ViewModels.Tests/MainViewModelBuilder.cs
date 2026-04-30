@@ -69,6 +69,8 @@ public class MainViewModelBuilder
             vehicleProfileService: VehicleProfileService,
             configurationService: Substitute.For<IConfigurationService>(),
             autoSteerService: AutoSteerService,
+            smartWasService: Substitute.For<ISmartWasCalibrationService>(),
+            trackCopierService: Substitute.For<ITrackCopierService>(),
             moduleCommunicationService: Substitute.For<IModuleCommunicationService>(),
             toolPositionService: Substitute.For<IToolPositionService>(),
             coverageMapService: CoverageMapService,

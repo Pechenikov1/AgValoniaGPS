@@ -60,6 +60,19 @@ namespace AgValoniaGPS.Models
         public double CameraZoom { get; set; } = 100.0;
         public double CameraPitch { get; set; } = -60.0;
 
+        // Coverage display resolution multiplier (1.0 = Ultra, 1.5 = High,
+        // 2.5 = Medium, 4.0 = Low, 6.0 = Minimum). Default mirrors the
+        // platform-aware default in DisplayConfig so a missing settings file
+        // produces the same first-launch behavior as a fresh DisplayConfig.
+        public double DisplayResolutionMultiplier { get; set; } =
+            OperatingSystem.IsAndroid() || OperatingSystem.IsIOS() ? 1.5 : 1.0;
+
+        // Auto day/night switching by clock time, and the current day/night
+        // mode. Both default to match DisplayConfig field initializers so a
+        // fresh AppSettings reproduces the in-memory defaults.
+        public bool AutoDayNight { get; set; } = true;
+        public bool IsDayMode { get; set; } = true;
+
         // NTRIP settings
         public string NtripCasterIp { get; set; } = string.Empty;
         public int NtripCasterPort { get; set; } = 2101;

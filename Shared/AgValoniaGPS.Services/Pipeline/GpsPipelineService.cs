@@ -684,30 +684,25 @@ public sealed class GpsPipelineService : IGpsPipelineService
         _guidanceWorking.CrossTrackError = crossTrackError;
         _guidanceWorking.GoalPoint = new Vec2(goalE, goalN);
 
-        // ── (7) Section control ─────────────────────────────────────────
+        // ── (7) Section control + coverage painting ─────────────────────
+        // SectionControlService.Update internally walks each section and
+        // calls UpdateMapping → AddCoveragePoint with expanded edges. It
+        // is the SOLE writer of coverage points — no second pass here.
         _sectionControlService.Update(toolPos, toolHeading, headingRad, pos.Speed);
-
-        // ── (8) Coverage painting ───────────────────────────────────────
         var sectionStates = _sectionControlService.SectionStates;
         int numSections = _sectionControlService.NumSections;
-        bool anyCoverage = false;
 
-        for (int i = 0; i < numSections; i++)
-        {
-            var sec = sectionStates[i];
-            if (sec.IsMappingOn)
-            {
-                var (left, right) = _toolPositionService.GetSectionEdgePositions(
-                    sec.PositionLeft, sec.PositionRight);
-                _coverageMapService.AddCoveragePoint(i,
-                    new Vec2(left.Easting, left.Northing),
-                    new Vec2(right.Easting, right.Northing));
-                anyCoverage = true;
-            }
-        }
-
-        if (anyCoverage)
-            _coverageMapService.FlushCoverageUpdate();
+        // ── (8b) Hydraulic lift state (PGN 239 input) ───────────────────
+        // Phase B completion: this used to live on the UI-thread legacy
+        // path (MainViewModel.UpdateToolPositionProperties). Moved here so
+        // SetMachineState's three fields (section bits, U-turn state,
+        // hyd-lift state) are all written by the cycle, before the PGN
+        // build in (9) reads them.
+        byte hydLiftState = ComputeHydLiftState(toolPos, pos.Speed, headlandLine);
+        _autoSteerService.SetMachineState(
+            _sectionControlService.GetSectionBits(),
+            isInYouTurn,
+            hydLiftState);
 
         // ── (9) AutoSteer pipeline (PGN/latency) ────────────────────────
         _autoSteerService.ProcessSimulatedPosition(
@@ -758,12 +753,15 @@ public sealed class GpsPipelineService : IGpsPipelineService
             // GPS position
             Latitude = pos.Latitude,
             Longitude = pos.Longitude,
+            Altitude = pos.Altitude,
             Easting = driftedEasting,
             Northing = driftedNorthing,
             Heading = pos.Heading,
             Speed = pos.Speed,
             RollDegrees = data.ImuRoll,
             SatelliteCount = data.SatellitesInUse,
+            Hdop = data.Hdop,
+            DifferentialAge = data.DifferentialAge,
             FixQuality = data.FixQuality,
             GpsValid = data.IsValid,
 
@@ -1228,6 +1226,36 @@ public sealed class GpsPipelineService : IGpsPipelineService
         warning = output.ShouldTriggerWarning;
     }
 
+    /// <summary>
+    /// Compute PGN 239 hydraulic-lift state. Migrated from
+    /// MainViewModel.CalculateHydLiftState (Phase B completion). Reads
+    /// State.Field for the boundary/headland — read-only from cycle is
+    /// §0-clean.
+    ///
+    /// Returns: 0 = off, 1 = lower (in cultivated area), 2 = raise (in headland zone).
+    /// </summary>
+    private byte ComputeHydLiftState(Vec3 toolPosition, double speed, List<Vec3>? headlandLine)
+    {
+        var machine = ConfigurationStore.Instance.Machine;
+        if (!machine.HydraulicLiftEnabled) return 0;
+
+        // Don't operate at very low speed or in reverse
+        if (speed < 0.2 || speed < -0.1) return 0;
+
+        if (headlandLine == null || headlandLine.Count < 3) return 0;
+
+        var boundary = _appState.Field.CurrentBoundary;
+        if (boundary == null || !boundary.IsValid) return 0;
+
+        bool inBoundary = boundary.IsPointInside(toolPosition.Easting, toolPosition.Northing);
+        if (!inBoundary) return 0;
+
+        bool inCultivatedArea = Models.Base.GeometryMath.IsPointInPolygon(
+            headlandLine, new Vec2(toolPosition.Easting, toolPosition.Northing));
+
+        return inCultivatedArea ? (byte)1 : (byte)2;
+    }
+
     private void CheckRtkQualityChange(int fixQuality)
     {
         if (fixQuality != _previousFixQuality)
@@ -1242,14 +1270,29 @@ public sealed class GpsPipelineService : IGpsPipelineService
         }
     }
 
+    /// <summary>
+    /// Section display color codes matching legacy AgOpenGPS states:
+    /// 0 = Off (red), 1 = Manual ON (yellow), 2 = Auto ON (green),
+    /// 3 = Turning OFF (on but requested off - cyan), 4 = Turning ON (off but requested on - orange)
+    /// </summary>
     private static int GetSectionColorCode(SectionControlState state)
     {
-        return state.ButtonState switch
-        {
-            SectionButtonState.Off => 0,
-            SectionButtonState.On => 1,
-            SectionButtonState.Auto => 2,
-            _ => 0
-        };
+        // Manual override states
+        if (state.ButtonState == SectionButtonState.Off)
+            return 0; // Off (red)
+        if (state.ButtonState == SectionButtonState.On)
+            return 1; // Manual ON (yellow)
+
+        // Auto mode transition states
+        if (state.IsOn && state.SectionOffRequest)
+            return 3; // Turning OFF: valve open but shutting down (cyan)
+        if (!state.IsOn && state.SectionOnRequest)
+            return 4; // Turning ON: valve closed but opening (orange)
+
+        // Auto mode steady states
+        if (state.IsOn)
+            return 2; // Auto ON (green)
+
+        return 5; // Auto OFF (gray)
     }
 }

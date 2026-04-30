@@ -623,6 +623,9 @@ public class ConfigurationServiceMappingTests
         _settings.ElevationLogEnabled = true;
         _settings.CameraZoom = 9999;
         _settings.CameraPitch = -50;
+        _settings.DisplayResolutionMultiplier = 4.0;
+        _settings.AutoDayNight = false;
+        _settings.IsDayMode = false;
         _settings.NtripCasterIp = "MAPPED";
         _settings.NtripCasterPort = 9999;
         _settings.NtripMountPoint = "MAPPED";

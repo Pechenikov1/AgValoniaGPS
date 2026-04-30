@@ -92,6 +92,12 @@ public static class ServiceCollectionExtensions
         // AutoSteer pipeline service (zero-copy GPS→PGN path)
         services.AddSingleton<IAutoSteerService, AutoSteerService>();
 
+        // Smart WAS calibration (statistical WAS zero analyzer)
+        services.AddSingleton<ISmartWasCalibrationService, SmartWasCalibrationService>();
+
+        // Track copying between fields (transforms via source plane → WGS84 → target plane)
+        services.AddSingleton<ITrackCopierService, TrackCopierService>();
+
         // Chart data service (collects rolling time-series for diagnostic charts)
         services.AddSingleton<IChartDataService, ChartDataService>();
 

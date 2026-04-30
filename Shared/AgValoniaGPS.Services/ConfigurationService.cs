@@ -158,6 +158,9 @@ public class ConfigurationService(
         store.Display.ElevationLogEnabled = settings.ElevationLogEnabled;
         store.Display.CameraZoom = settings.CameraZoom;
         store.Display.CameraPitch = settings.CameraPitch;
+        store.Display.DisplayResolutionMultiplier = settings.DisplayResolutionMultiplier;
+        store.Display.AutoDayNight = settings.AutoDayNight;
+        store.Display.IsDayMode = settings.IsDayMode;
 
         // Connection config
         store.Connections.NtripCasterHost = settings.NtripCasterIp;
@@ -219,6 +222,9 @@ public class ConfigurationService(
         settings.ElevationLogEnabled = store.Display.ElevationLogEnabled;
         settings.CameraZoom = store.Display.CameraZoom;
         settings.CameraPitch = store.Display.CameraPitch;
+        settings.DisplayResolutionMultiplier = store.Display.DisplayResolutionMultiplier;
+        settings.AutoDayNight = store.Display.AutoDayNight;
+        settings.IsDayMode = store.Display.IsDayMode;
 
         // Connection config
         settings.NtripCasterIp = store.Connections.NtripCasterHost;

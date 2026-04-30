@@ -270,6 +270,7 @@ internal class MapRenderState
     public bool SvennArrowVisible;
     public bool DirectionMarkersVisible;
     public bool FieldTextureVisible;
+    public bool LineSmoothEnabled;
     public bool ExtraGuidelines;
     public int ExtraGuidelinesCount;
     public bool HeadlandDistanceVisible;
@@ -362,7 +363,7 @@ public class DrawingContextMapControl : Control, ISharedMapControl
     private double _cameraDistance = 100.0;
     private bool _is3DMode = false;
     private bool _isNorthUp = false;
-    private bool _isDayMode = true;
+    private bool _isDayMode = AgValoniaGPS.Models.Configuration.ConfigurationStore.Instance.Display.IsDayMode;
 
     // Camera follow mode: 0=NorthUp, 1=HeadingUp, 2=Free
     private int _cameraFollowMode = 0;
@@ -603,7 +604,10 @@ public class DrawingContextMapControl : Control, ISharedMapControl
             using var nightStream = AssetLoader.Open(nightUri);
             _groundTextureNight = new Bitmap(nightStream);
 
-            _groundTexture = _groundTextureDay;
+            // Pick the texture matching the persisted day/night mode rather
+            // than always defaulting to day — the field initializer for
+            // _isDayMode now reads ConfigurationStore.Display.IsDayMode.
+            _groundTexture = _isDayMode ? _groundTextureDay : _groundTextureNight;
             Debug.WriteLine("[DrawingContextMapControl] Loaded ground textures (day + night)");
         }
         catch (Exception ex)
@@ -856,6 +860,7 @@ public class DrawingContextMapControl : Control, ISharedMapControl
             SvennArrowVisible = displayCfg.SvennArrowVisible,
             DirectionMarkersVisible = displayCfg.DirectionMarkersVisible,
             FieldTextureVisible = displayCfg.FieldTextureVisible,
+            LineSmoothEnabled = displayCfg.LineSmoothEnabled,
             ExtraGuidelines = displayCfg.ExtraGuidelines,
             ExtraGuidelinesCount = displayCfg.ExtraGuidelinesCount,
             HeadlandDistanceVisible = displayCfg.HeadlandDistanceVisible,
@@ -3167,17 +3172,22 @@ public class DrawingContextMapControl : Control, ISharedMapControl
         private DateTime _coverageSnapshotTime = DateTime.MinValue;
         private int _coverageSnapshotInFlight;        // 0 = idle, 1 = bg task running
         private const double CoverageSnapshotIntervalMs = 200.0;
-        private static readonly SKSamplingOptions _coverageSampling =
+        private static readonly SKSamplingOptions _coverageSamplingNearest =
             new SKSamplingOptions(SKFilterMode.Nearest, SKMipmapMode.None);
+        private static readonly SKSamplingOptions _coverageSamplingLinear =
+            new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.None);
 
         // Immutable brushes
         private static readonly IImmutableBrush _vehicleBrushImm = new ImmutableSolidColorBrush(Color.FromRgb(0, 200, 0));
         private static readonly IImmutableBrush _recordingPointBrushImm = new ImmutableSolidColorBrush(Color.FromRgb(255, 128, 0));
         private static readonly IImmutableBrush _pointABrushImm = new ImmutableSolidColorBrush(Color.FromRgb(0, 255, 0));
         private static readonly IImmutableBrush _pointBBrushImm = new ImmutableSolidColorBrush(Color.FromRgb(255, 0, 0));
-        private static readonly IImmutableBrush _sectionOffBrushImm = new ImmutableSolidColorBrush(Color.FromRgb(242, 51, 51));
-        private static readonly IImmutableBrush _sectionManualOnBrushImm = new ImmutableSolidColorBrush(Color.FromRgb(247, 247, 0));
-        private static readonly IImmutableBrush _sectionAutoOnBrushImm = new ImmutableSolidColorBrush(Color.FromRgb(0, 242, 0));
+        private static readonly IImmutableBrush _sectionOffBrushImm = new ImmutableSolidColorBrush(Color.FromRgb(242, 51, 51));        // Red
+        private static readonly IImmutableBrush _sectionManualOnBrushImm = new ImmutableSolidColorBrush(Color.FromRgb(247, 247, 0)); // Yellow
+        private static readonly IImmutableBrush _sectionAutoOnBrushImm = new ImmutableSolidColorBrush(Color.FromRgb(0, 242, 0));    // Green
+        private static readonly IImmutableBrush _sectionTurningOffBrushImm = new ImmutableSolidColorBrush(Color.FromRgb(0, 222, 222)); // Cyan
+        private static readonly IImmutableBrush _sectionTurningOnBrushImm = new ImmutableSolidColorBrush(Color.FromRgb(255, 165, 0));  // Orange
+        private static readonly IImmutableBrush _sectionAutoOffBrushImm = new ImmutableSolidColorBrush(Color.FromRgb(150, 150, 150));  // Gray
 
         public MapCompositionHandler(DrawingContextMapControl owner)
         {
@@ -3828,7 +3838,8 @@ public class DrawingContextMapControl : Control, ISharedMapControl
                 (float)s.BitmapMinE, (float)s.BitmapMinN,
                 (float)(s.BitmapMinE + worldWidth), (float)(s.BitmapMinN + worldHeight));
 
-            canvas.DrawImage(_coverageSnapshot, src, dst, _coverageSampling);
+            var sampling = s.LineSmoothEnabled ? _coverageSamplingLinear : _coverageSamplingNearest;
+            canvas.DrawImage(_coverageSnapshot, src, dst, sampling);
         }
 
         private void DrawBoundary(SKCanvas canvas, MapRenderState s)
@@ -4263,8 +4274,12 @@ public class DrawingContextMapControl : Control, ISharedMapControl
 
                         IImmutableBrush brush = s.SectionButtonState[i] switch
                         {
-                            0 => _sectionOffBrushImm,
-                            2 => _sectionManualOnBrushImm,
+                            0 => _sectionOffBrushImm,          // Manual Off (red)
+                            1 => _sectionManualOnBrushImm,     // Manual ON (yellow)
+                            2 => _sectionAutoOnBrushImm,       // Auto ON (green)
+                            3 => _sectionTurningOffBrushImm,   // Turning OFF (cyan)
+                            4 => _sectionTurningOnBrushImm,    // Turning ON (orange)
+                            5 => _sectionAutoOffBrushImm,      // Auto OFF (gray)
                             _ => _sectionAutoOnBrushImm
                         };
                         dc.DrawRectangle(brush, _sectionOutlinePenImm,
@@ -4619,9 +4634,13 @@ public class DrawingContextMapControl : Control, ISharedMapControl
 
                     SKColor secColor = s.SectionButtonState[i] switch
                     {
-                        0 => new SKColor(242, 51, 51),   // Off = red
-                        2 => new SKColor(247, 247, 0),    // ManualOn = yellow
-                        _ => new SKColor(0, 242, 0)       // AutoOn = green
+                        0 => new SKColor(242, 51, 51),   // Off (red)
+                        1 => new SKColor(247, 247, 0),   // Manual ON (yellow)
+                        2 => new SKColor(0, 242, 0),     // Auto ON (green)
+                        3 => new SKColor(0, 222, 222),   // Turning OFF (cyan)
+                        4 => new SKColor(255, 165, 0),   // Turning ON (orange)
+                        5 => new SKColor(150, 150, 150), // Auto OFF (gray)
+                        _ => new SKColor(0, 242, 0)
                     };
 
                     using var secPaint = new SKPaint { Color = secColor, Style = SKPaintStyle.Fill };
