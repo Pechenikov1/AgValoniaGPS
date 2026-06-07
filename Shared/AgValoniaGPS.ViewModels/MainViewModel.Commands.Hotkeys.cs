@@ -48,8 +48,7 @@ public partial class MainViewModel
     {
         ShowHotkeyConfigDialogCommand = new RelayCommand(() =>
         {
-            IsFileMenuPanelVisible = false;
-            State.UI.ShowDialog(DialogType.HotkeyConfig);
+            OpenChainDialog(DialogType.HotkeyConfig);
         });
 
         CloseHotkeyConfigDialogCommand = new RelayCommand(() =>
@@ -86,7 +85,7 @@ public partial class MainViewModel
             { HotkeyAction.SnapPivot, SnapToPivotCommand },
             { HotkeyAction.NudgeLeft, NudgeLeftCommand },
             { HotkeyAction.NudgeRight, NudgeRightCommand },
-            { HotkeyAction.VehicleSettings, ShowConfigurationDialogCommand },
+            { HotkeyAction.VehicleSettings, ShowVehicleConfigDialogCommand },
             { HotkeyAction.SteerWizard, ShowSteerWizardCommand },
         };
     }

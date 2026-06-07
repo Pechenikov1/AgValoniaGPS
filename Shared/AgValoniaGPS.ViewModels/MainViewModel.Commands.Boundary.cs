@@ -158,7 +158,7 @@ public partial class MainViewModel
         // AgShare Dialogs
         ShowAgShareDownloadDialogCommand = new RelayCommand(() =>
         {
-            State.UI.ShowDialog(DialogType.AgShareDownload);
+            OpenChainDialog(DialogType.AgShareDownload);
         });
 
         CancelAgShareDownloadDialogCommand = new RelayCommand(() =>
@@ -168,7 +168,7 @@ public partial class MainViewModel
 
         ShowAgShareUploadDialogCommand = new RelayCommand(() =>
         {
-            State.UI.ShowDialog(DialogType.AgShareUpload);
+            OpenChainDialog(DialogType.AgShareUpload);
         });
 
         CancelAgShareUploadDialogCommand = new RelayCommand(() =>
@@ -178,10 +178,11 @@ public partial class MainViewModel
 
         ShowAgShareSettingsDialogCommand = new RelayCommand(() =>
         {
-            AgShareSettingsServerUrl = _settingsService.Settings.AgShareServer;
-            AgShareSettingsApiKey = _settingsService.Settings.AgShareApiKey;
-            AgShareSettingsEnabled = _settingsService.Settings.AgShareEnabled;
-            State.UI.ShowDialog(DialogType.AgShareSettings);
+            // Seed the dialog from the store (single source of truth).
+            AgShareSettingsServerUrl = ConfigStore.Connections.AgShareServer;
+            AgShareSettingsApiKey = ConfigStore.Connections.AgShareApiKey;
+            AgShareSettingsEnabled = ConfigStore.Connections.AgShareEnabled;
+            OpenChainDialog(DialogType.AgShareSettings);
         });
 
         CancelAgShareSettingsDialogCommand = new RelayCommand(() =>
@@ -191,10 +192,11 @@ public partial class MainViewModel
 
         ConfirmAgShareSettingsDialogCommand = new RelayCommand(() =>
         {
-            _settingsService.Settings.AgShareServer = AgShareSettingsServerUrl;
-            _settingsService.Settings.AgShareApiKey = AgShareSettingsApiKey;
-            _settingsService.Settings.AgShareEnabled = AgShareSettingsEnabled;
-            _settingsService.Save();
+            // Write through the store, then persist store→DTO→disk. No DTO bypass.
+            ConfigStore.Connections.AgShareServer = AgShareSettingsServerUrl;
+            ConfigStore.Connections.AgShareApiKey = AgShareSettingsApiKey;
+            ConfigStore.Connections.AgShareEnabled = AgShareSettingsEnabled;
+            _configurationService.SaveAppSettings();
             State.UI.CloseDialog();
             StatusMessage = "AgShare settings saved";
         });
@@ -212,7 +214,7 @@ public partial class MainViewModel
                 StatusMessage = "Open a field first";
                 return;
             }
-            State.UI.ShowDialog(DialogType.FieldBuilder);
+            OpenChainDialog(DialogType.FieldBuilder);
             UpdateHeadlandPreview();
         });
 
@@ -313,7 +315,7 @@ public partial class MainViewModel
         // Headland Dialog - now opens Field Builder
         ShowHeadlandDialogCommand = new RelayCommand(() =>
         {
-            State.UI.ShowDialog(DialogType.FieldBuilder);
+            OpenChainDialog(DialogType.FieldBuilder);
             UpdateHeadlandPreview();
         });
 
@@ -562,6 +564,7 @@ public partial class MainViewModel
         {
             var prev = _previousDialogBeforeConfirmation;
             _confirmationDialogCallback = null;
+            _confirmationDialogCheckboxCallback = null;
             _previousDialogBeforeConfirmation = Models.State.DialogType.None;
             if (prev != Models.State.DialogType.None && prev != Models.State.DialogType.Confirmation)
                 State.UI.ShowDialog(prev);
@@ -572,14 +575,18 @@ public partial class MainViewModel
         ConfirmConfirmationDialogCommand = new RelayCommand(() =>
         {
             var callback = _confirmationDialogCallback;
+            var checkboxCallback = _confirmationDialogCheckboxCallback;
+            var checkboxState = ConfirmationDialogCheckboxChecked;
             var prev = _previousDialogBeforeConfirmation;
             _confirmationDialogCallback = null;
+            _confirmationDialogCheckboxCallback = null;
             _previousDialogBeforeConfirmation = Models.State.DialogType.None;
             if (prev != Models.State.DialogType.None && prev != Models.State.DialogType.Confirmation)
                 State.UI.ShowDialog(prev);
             else
                 State.UI.CloseDialog();
             callback?.Invoke();
+            checkboxCallback?.Invoke(checkboxState);
         });
 
         // Error Dialog Command

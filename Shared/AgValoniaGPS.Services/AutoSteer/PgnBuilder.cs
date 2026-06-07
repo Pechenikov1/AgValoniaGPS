@@ -38,6 +38,7 @@ public static class PgnBuilder
     // PGN identifiers (from PgnNumbers)
     public const byte PGN_AUTOSTEER = 0xFE;      // 254 - AutoSteer Data
     public const byte PGN_MACHINE = 0xEF;        // 239 - Machine Data
+    public const byte PGN_SECTIONS_64 = 0xE5;    // 229 - 64-section on/off + L/R speed
     public const byte PGN_STEER_SETTINGS = 0xFC; // 252 - Steer Settings
     public const byte PGN_STEER_CONFIG = 0xFB;   // 251 - Steer Config
     public const byte PGN_MACHINE_CONFIG = 0xEE;  // 238 - Machine Config
@@ -48,6 +49,7 @@ public static class PgnBuilder
     // Buffer sizes: header(2) + source(1) + pgn(1) + length(1) + data(N) + crc(1)
     public const int AUTOSTEER_PGN_SIZE = 14;       // 5 header + 8 data + 1 crc
     public const int MACHINE_PGN_SIZE = 14;         // 5 header + 8 data + 1 crc
+    public const int SECTIONS_64_PGN_SIZE = 16;     // 5 header + 10 data + 1 crc
     public const int STEER_SETTINGS_PGN_SIZE = 14;  // 5 header + 8 data + 1 crc
     public const int STEER_CONFIG_PGN_SIZE = 11;    // 5 header + 5 data + 1 crc
     public const int MACHINE_CONFIG_PGN_SIZE = 14;  // 5 header + 8 data + 1 crc
@@ -59,6 +61,9 @@ public static class PgnBuilder
 
     [ThreadStatic]
     private static byte[]? _machineBuffer;
+
+    [ThreadStatic]
+    private static byte[]? _sections64Buffer;
 
     [ThreadStatic]
     private static byte[]? _steerSettingsBuffer;
@@ -80,7 +85,11 @@ public static class PgnBuilder
     ///
     /// When IsInFreeDriveMode is true, overrides speed/status/angle for testing:
     /// - Speed set to 8.0 km/h (fake speed to allow motor operation)
-    /// - Status set to 1 (autosteer enabled)
+    /// - Status set to SteerSwitchActive (0x01) + AutoSteerEngaged (0x04)
+    ///   so the firmware/simulator PID actually drives toward the
+    ///   commanded angle. The previous value (0x01 alone) left
+    ///   IsEngaged=false on the receiver, so the wizard's motor ramp
+    ///   commands were silently dropped.
     /// - SteerAngle from FreeDriveSteerAngle instead of guidance
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -106,8 +115,11 @@ public static class PgnBuilder
             buf[5] = (byte)(freeSpeed & 0xFF);        // low byte
             buf[6] = (byte)(freeSpeed >> 8);          // high byte
 
-            // Status = 1 (autosteer enabled for testing)
-            buf[7] = 1;
+            // Status: SteerSwitchActive (0x01) + AutoSteerEngaged (0x04).
+            // The receiver's PID gates on bit 0x04; the lone bit 0x01
+            // alone (former value) was insufficient and left free-drive
+            // commands as no-ops on the simulator.
+            buf[7] = 0x01 | 0x04;
 
             // Use free drive steer angle instead of guidance angle
             // Little-endian: low byte first
@@ -220,6 +232,52 @@ public static class PgnBuilder
     }
 
     /// <summary>
+    /// Build PGN 229 (0xE5) — 64-section on/off plus left/right speed.
+    /// Sent in addition to PGN 239 when more than 16 sections are configured;
+    /// the firmware reconciles the overlap on sections 1–16.
+    ///
+    /// Byte 5:  SC1to8   (sections 1–8 bitmask)
+    /// Byte 6:  SC9to16  (sections 9–16)
+    /// Byte 7:  SC17to24
+    /// Byte 8:  SC25to32
+    /// Byte 9:  SC33to40
+    /// Byte 10: SC41to48
+    /// Byte 11: SC49to56
+    /// Byte 12: SC57to64
+    /// Byte 13: Lspeed (speed * 10, clamped 0–255)
+    /// Byte 14: Rspeed (speed * 10, clamped 0–255)
+    /// Byte 15: CRC
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static byte[] BuildSection64Pgn(ref VehicleState state)
+    {
+        _sections64Buffer ??= new byte[SECTIONS_64_PGN_SIZE];
+        var buf = _sections64Buffer;
+
+        // Header
+        buf[0] = HEADER1;
+        buf[1] = HEADER2;
+        buf[2] = SOURCE;
+        buf[3] = PGN_SECTIONS_64;
+        buf[4] = 10;  // Data length
+
+        // 64 section bits, little-endian (section 1 = bit 0 of byte 5)
+        ulong sections = state.SectionStates;
+        for (int i = 0; i < 8; i++)
+            buf[5 + i] = (byte)((sections >> (8 * i)) & 0xFF);
+
+        // L/R speed mirror PGN 239's speed byte (speed * 10, clamped to a byte)
+        byte speed = (byte)Math.Clamp((int)(state.SpeedKmh * 10), 0, 255);
+        buf[13] = speed;
+        buf[14] = speed;
+
+        // CRC: sum of bytes 2 through 14 (source through last data byte)
+        buf[15] = CalculateCrc(buf, 2, 13);
+
+        return buf;
+    }
+
+    /// <summary>
     /// Build PGN 238 (0xEE) Machine Config - hydraulic settings and user values.
     /// Sent to machine module when config changes (not periodic).
     ///
@@ -299,6 +357,50 @@ public static class PgnBuilder
             crc += data[i];
         }
         return crc;
+    }
+
+    // ===== Module network config (AgIO parity: FormUDP.cs / UDP.designer.cs) =====
+    // These reproduce AgIO's exact wire bytes so the existing AiO board install
+    // base responds correctly. AgIO hardcodes the trailing CRC byte (0x47) for
+    // the scan (202) and set-subnet (201) packets and the modules validate only
+    // the magic bytes (data[5]/[6]), not the CRC — so we keep 0x47 verbatim.
+
+    /// <summary>
+    /// Build PGN 202 — "scan request" broadcast that asks every module to reply
+    /// with its IP/subnet (PGN 203). Exact AgIO bytes:
+    /// { 0x80, 0x81, 0x7F, 202, 3, 202, 202, 5, 0x47 }.
+    /// </summary>
+    public static byte[] BuildScanRequest()
+        => new byte[] { HEADER1, HEADER2, SOURCE, PgnNumbers.SCAN_REQUEST, 3, 202, 202, 5, 0x47 };
+
+    /// <summary>
+    /// Build PGN 201 — "set subnet" broadcast. Changes the first three IP octets
+    /// (the /24) on ALL modules at once; the host octet is preserved by each
+    /// module. There is no per-module selector — this is global, matching AgIO.
+    /// Exact AgIO bytes: { 0x80, 0x81, 0x7F, 201, 5, 201, 201, o1, o2, o3, 0x47 }.
+    /// </summary>
+    public static byte[] BuildSubnetChange(byte octet1, byte octet2, byte octet3)
+        => new byte[] { HEADER1, HEADER2, SOURCE, PgnNumbers.SET_SUBNET, 5, 201, 201, octet1, octet2, octet3, 0x47 };
+
+    /// <summary>
+    /// Parse a PGN 203 scan reply (13 bytes): module id at [2], full module IP at
+    /// [5..8], subnet (3 octets) at [9..11]. Returns false if not a well-formed
+    /// scan reply. Pure so it can be unit-tested without sockets.
+    /// </summary>
+    public static bool TryParseScanReply(byte[] data, out byte moduleId, out string ip, out string subnet)
+    {
+        moduleId = 0;
+        ip = string.Empty;
+        subnet = string.Empty;
+
+        if (data == null || data.Length < 12) return false;
+        if (data[0] != HEADER1 || data[1] != HEADER2) return false;
+        if (data[3] != PgnNumbers.SCAN_REPLY) return false;
+
+        moduleId = data[2];
+        ip = $"{data[5]}.{data[6]}.{data[7]}.{data[8]}";
+        subnet = $"{data[9]}.{data[10]}.{data[11]}";
+        return true;
     }
 
     /// <summary>

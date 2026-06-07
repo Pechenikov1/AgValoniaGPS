@@ -16,6 +16,7 @@
 
 using System;
 using CommunityToolkit.Mvvm.ComponentModel;
+using AgValoniaGPS.Models;
 
 namespace AgValoniaGPS.Models.Configuration;
 
@@ -40,6 +41,26 @@ public class DisplayConfig : ObservableObject
         set => SetProperty(ref _compassVisible, value);
     }
 
+    // On-map field-stats detail card. Replaces the old auto-show-when-active
+    // top-right strip with an explicit strip toggle. Default OFF.
+    private bool _fieldStatsOnMapVisible;
+    public bool FieldStatsOnMapVisible
+    {
+        get => _fieldStatsOnMapVisible;
+        set => SetProperty(ref _fieldStatsOnMapVisible, value);
+    }
+
+    // On-map GPS detail card. Toggled by tapping the strip's Modules
+    // aggregate button (which still tracks colour for the aggregate). Lands
+    // at the same on-map slot as the Field-Stats card; if both are on they
+    // overlap and the user picks which one to keep open. Default OFF.
+    private bool _gpsDetailOverlayVisible;
+    public bool GpsDetailOverlayVisible
+    {
+        get => _gpsDetailOverlayVisible;
+        set => SetProperty(ref _gpsDetailOverlayVisible, value);
+    }
+
     private bool _speedVisible = true;
     public bool SpeedVisible
     {
@@ -47,99 +68,10 @@ public class DisplayConfig : ObservableObject
         set => SetProperty(ref _speedVisible, value);
     }
 
-    // Camera
-    private double _cameraZoom = 100.0;
-    public double CameraZoom
-    {
-        get => _cameraZoom;
-        set => SetProperty(ref _cameraZoom, value);
-    }
-
-    private double _cameraPitch = -60.0;
-    public double CameraPitch
-    {
-        get => _cameraPitch;
-        set => SetProperty(ref _cameraPitch, Math.Clamp(value, -90, -20));
-    }
-
-    private bool _is2DMode;
-    public bool Is2DMode
-    {
-        get => _is2DMode;
-        set => SetProperty(ref _is2DMode, value);
-    }
-
-    private bool _isNorthUp = false;
-    public bool IsNorthUp
-    {
-        get => _isNorthUp;
-        set => SetProperty(ref _isNorthUp, value);
-    }
-
-    private bool _isDayMode = true;
-    public bool IsDayMode
-    {
-        get => _isDayMode;
-        set => SetProperty(ref _isDayMode, value);
-    }
-
-    // Window (Desktop only, ignored on iOS)
-    private double _windowWidth = 1200;
-    public double WindowWidth
-    {
-        get => _windowWidth;
-        set => SetProperty(ref _windowWidth, value);
-    }
-
-    private double _windowHeight = 800;
-    public double WindowHeight
-    {
-        get => _windowHeight;
-        set => SetProperty(ref _windowHeight, value);
-    }
-
-    private double _windowX = 100;
-    public double WindowX
-    {
-        get => _windowX;
-        set => SetProperty(ref _windowX, value);
-    }
-
-    private double _windowY = 100;
-    public double WindowY
-    {
-        get => _windowY;
-        set => SetProperty(ref _windowY, value);
-    }
-
-    private bool _windowMaximized;
-    public bool WindowMaximized
-    {
-        get => _windowMaximized;
-        set => SetProperty(ref _windowMaximized, value);
-    }
-
-    // Panel positions
-    private double _simulatorPanelX = double.NaN;
-    public double SimulatorPanelX
-    {
-        get => _simulatorPanelX;
-        set => SetProperty(ref _simulatorPanelX, value);
-    }
-
-    private double _simulatorPanelY = double.NaN;
-    public double SimulatorPanelY
-    {
-        get => _simulatorPanelY;
-        set => SetProperty(ref _simulatorPanelY, value);
-    }
-
-    private bool _simulatorPanelVisible;
-    public bool SimulatorPanelVisible
-    {
-        get => _simulatorPanelVisible;
-        set => SetProperty(ref _simulatorPanelVisible, value);
-    }
+    // NOTE: Camera view (Zoom/Pitch/Mode), day/night current value, 2D/north-up
+    // orientation, window geometry, and panel positions are persistent
+    // application STATE ("where the app was"), not config. They moved to
+    // PersistentAppState (appstate.json). Only display PREFERENCES remain here.
 
     // Display Options (toggle buttons)
     private bool _polygonsVisible = true;
@@ -217,6 +149,19 @@ public class DisplayConfig : ObservableObject
     {
         get => _fieldTextureVisible;
         set => SetProperty(ref _fieldTextureVisible, value);
+    }
+
+    private bool _fieldTextureMoveable;
+    /// <summary>
+    /// When true, the ground texture is rendered as world-tiled bitmaps
+    /// so it visibly scrolls under the tractor as the camera pans. When
+    /// false (default), the texture is rendered as a single stretched
+    /// bitmap centered on the camera — FPS-stable but visually static.
+    /// </summary>
+    public bool FieldTextureMoveable
+    {
+        get => _fieldTextureMoveable;
+        set => SetProperty(ref _fieldTextureMoveable, value);
     }
 
     private bool _extraGuidelines;

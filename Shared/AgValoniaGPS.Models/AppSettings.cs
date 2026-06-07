@@ -24,12 +24,9 @@ namespace AgValoniaGPS.Models
     /// </summary>
     public class AppSettings
     {
-        // Window settings
-        public double WindowWidth { get; set; } = 1200;
-        public double WindowHeight { get; set; } = 800;
-        public double WindowX { get; set; } = 100;
-        public double WindowY { get; set; } = 100;
-        public bool WindowMaximized { get; set; } = false;
+        // Window geometry (WindowWidth/Height/X/Y/Maximized) is persistent
+        // application STATE, not config — it now lives in PersistentAppState
+        // (appstate.json), not here.
         public bool StartFullscreen { get; set; } = false;
         public bool SvennArrowVisible { get; set; } = false;
         public bool KeyboardEnabled { get; set; } = false;
@@ -37,15 +34,31 @@ namespace AgValoniaGPS.Models
         public bool ExtraGuidelines { get; set; } = false;
         public int ExtraGuidelinesCount { get; set; } = 10;
         public bool FieldTextureVisible { get; set; } = true;
+        public bool FieldTextureMoveable { get; set; } = false;
+
+        /// <summary>
+        /// Device-/user-scoped metric vs imperial preference. The source of
+        /// truth lives here (in AppSettings); vehicle profiles must not
+        /// dictate units. Default false (imperial) matches the legacy
+        /// per-vehicle default before the migration.
+        /// </summary>
+        public bool IsMetric { get; set; } = false;
+
+        /// <summary>
+        /// One-shot migration latch: if false, the next vehicle-profile
+        /// load that carries a legacy <c>General.IsMetric</c> field will
+        /// copy that value into <see cref="IsMetric"/> and set this flag
+        /// to true. Subsequent loads ignore the profile field — units are
+        /// then a device preference, not vehicle-scoped.
+        /// </summary>
+        public bool HasMigratedIsMetric { get; set; } = false;
         public bool AutoSteerSound { get; set; } = true;
         public bool UTurnSound { get; set; } = true;
         public bool HydraulicSound { get; set; } = true;
         public bool SectionsSound { get; set; } = true;
 
-        // Panel positions
-        public double SimulatorPanelX { get; set; } = double.NaN; // NaN means not set
-        public double SimulatorPanelY { get; set; } = double.NaN;
-        public bool SimulatorPanelVisible { get; set; } = false;
+        // Panel positions (SimulatorPanelX/Y/Visible) are persistent state →
+        // PersistentAppState.
 
         // Localization
         public string Language { get; set; } = "en";
@@ -56,9 +69,28 @@ namespace AgValoniaGPS.Models
         public bool SpeedVisible { get; set; } = true;
         public bool ElevationLogEnabled { get; set; } = false;
 
-        // Camera settings
-        public double CameraZoom { get; set; } = 100.0;
-        public double CameraPitch { get; set; } = -60.0;
+        // Display option toggles (preferences). Defaults mirror DisplayConfig.
+        public bool PolygonsVisible { get; set; } = true;
+        public bool SpeedometerVisible { get; set; } = true;
+        public bool LineSmoothEnabled { get; set; } = true;
+        public bool DirectionMarkersVisible { get; set; } = false;
+        public bool SectionLinesVisible { get; set; } = true;
+        public bool UTurnButtonVisible { get; set; } = true;
+        public bool LateralButtonVisible { get; set; } = true;
+        public bool HardwareMessagesEnabled { get; set; } = true;
+        public int DayStartHour { get; set; } = 6;
+        public int NightStartHour { get; set; } = 20;
+
+        // On-map field-stats detail card. Toggled from the strip; default OFF.
+        public bool FieldStatsOnMapVisible { get; set; } = false;
+
+        // On-map GPS detail card. Toggled from the strip's Modules button;
+        // default OFF. Shares the same on-map slot as the field-stats card.
+        public bool GpsDetailOverlayVisible { get; set; } = false;
+
+        // Camera view (CameraZoom/Pitch/Mode) and the current day/night value
+        // (IsDayMode) are "where the app was" → persistent state, in
+        // PersistentAppState. The AutoDayNight *preference* below stays config.
 
         // Coverage display resolution multiplier (1.0 = Ultra, 1.5 = High,
         // 2.5 = Medium, 4.0 = Low, 6.0 = Minimum). Default mirrors the
@@ -67,11 +99,9 @@ namespace AgValoniaGPS.Models
         public double DisplayResolutionMultiplier { get; set; } =
             OperatingSystem.IsAndroid() || OperatingSystem.IsIOS() ? 1.5 : 1.0;
 
-        // Auto day/night switching by clock time, and the current day/night
-        // mode. Both default to match DisplayConfig field initializers so a
-        // fresh AppSettings reproduces the in-memory defaults.
+        // Auto day/night switching by clock time (a preference → config). The
+        // CURRENT day/night value (IsDayMode) is state → PersistentAppState.
         public bool AutoDayNight { get; set; } = true;
-        public bool IsDayMode { get; set; } = true;
 
         // NTRIP settings
         public string NtripCasterIp { get; set; } = string.Empty;
@@ -81,25 +111,30 @@ namespace AgValoniaGPS.Models
         public string NtripPassword { get; set; } = string.Empty;
         public bool NtripAutoConnect { get; set; } = false;
 
-        // Simulator settings
+        // Simulator: whether the simulator is the GPS source is a preference
+        // (config). The last simulator POSITION (lat/lon/speed/steer) is state
+        // → PersistentAppState.
         public bool SimulatorEnabled { get; set; } = true;
-        public double SimulatorLatitude { get; set; } = 40.7128;
-        public double SimulatorLongitude { get; set; } = -74.0060;
-        public double SimulatorSpeed { get; set; } = 0.0;
-        public double SimulatorSteerAngle { get; set; } = 0.0;
 
         // GPS settings
         public int GpsUpdateRate { get; set; } = 10; // Hz
         public bool UseRtk { get; set; } = true;
 
-        // Field management
-        public string FieldsDirectory { get; set; } = string.Empty; // Will default to Documents/AgValoniaGPS/Fields
-        public string CurrentFieldName { get; set; } = string.Empty; // Currently open field
-        public string LastOpenedField { get; set; } = string.Empty; // Last field that was opened
+        // Module presence — which modules the user expects to be present.
+        // Drives the aggregate Module-status indicator in the top status strip.
+        // Toggle UI ships with the Network panel (next commit); defaults match
+        // the previous behavior of always expecting all four.
+        public bool IsGpsConfigured { get; set; } = true;
+        public bool IsImuConfigured { get; set; } = true;
+        public bool IsAutoSteerConfigured { get; set; } = true;
+        public bool IsMachineConfigured { get; set; } = true;
 
-        // First run
-        public bool IsFirstRun { get; set; } = true;
-        public DateTime LastRunDate { get; set; } = DateTime.MinValue;
+        // Field management. The Fields directory is a storage-location
+        // preference (config); the open-field / last-field POINTER is state →
+        // PersistentAppState (field DATA stays in field files).
+        public string FieldsDirectory { get; set; } = string.Empty; // Will default to Documents/AgValoniaGPS/Fields
+
+        // First-run / last-run are app-lifecycle state → PersistentAppState.
 
         // AgShare settings
         public string AgShareServer { get; set; } = "https://agshare.agopengps.com";
@@ -108,6 +143,7 @@ namespace AgValoniaGPS.Models
 
         // Vehicle profile settings
         public string LastUsedVehicleProfile { get; set; } = string.Empty;
+        public string LastUsedToolProfile { get; set; } = string.Empty;
 
         // Hotkey bindings (empty = use defaults)
         public Dictionary<string, string> HotkeyBindings { get; set; } = new();
@@ -121,36 +157,8 @@ namespace AgValoniaGPS.Models
             var defaults = new AppSettings();
             var fixes = new List<string>();
 
-            // Simulator coordinates
-            if (SimulatorLatitude < -90 || SimulatorLatitude > 90)
-            {
-                fixes.Add($"SimulatorLatitude was {SimulatorLatitude}, reset to {defaults.SimulatorLatitude}");
-                SimulatorLatitude = defaults.SimulatorLatitude;
-            }
-            if (SimulatorLongitude < -180 || SimulatorLongitude > 180)
-            {
-                fixes.Add($"SimulatorLongitude was {SimulatorLongitude}, reset to {defaults.SimulatorLongitude}");
-                SimulatorLongitude = defaults.SimulatorLongitude;
-            }
-
-            // Window dimensions
-            if (WindowWidth < 100 || WindowWidth > 10000)
-            {
-                fixes.Add($"WindowWidth was {WindowWidth}, reset to {defaults.WindowWidth}");
-                WindowWidth = defaults.WindowWidth;
-            }
-            if (WindowHeight < 100 || WindowHeight > 10000)
-            {
-                fixes.Add($"WindowHeight was {WindowHeight}, reset to {defaults.WindowHeight}");
-                WindowHeight = defaults.WindowHeight;
-            }
-
-            // Camera
-            if (CameraZoom < 1 || CameraZoom > 10000)
-            {
-                fixes.Add($"CameraZoom was {CameraZoom}, reset to {defaults.CameraZoom}");
-                CameraZoom = defaults.CameraZoom;
-            }
+            // Note: simulator-coordinate, window-dimension, and camera ranges
+            // are now validated by PersistentAppState (the values moved there).
 
             // GPS update rate
             if (GpsUpdateRate < 1 || GpsUpdateRate > 100)

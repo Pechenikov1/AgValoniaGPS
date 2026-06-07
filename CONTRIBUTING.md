@@ -97,9 +97,9 @@ Services are unit-testable without a dispatcher, a view, or a mocked VM. Once co
 
 AgValoniaGPS uses a strict one-way data flow driven by a dedicated background cycle worker. This is a hard architectural requirement, not a convention — violating it reintroduces the AgOpenGPS/WinForms failure mode where domain logic races on the UI thread.
 
-![Threading model](Plans/threading_model.svg)
+![Threading model](Plans/Completed/threading_model.svg)
 
-See [`Plans/threading_model_overview.svg`](Plans/threading_model_overview.svg) for the full picture (current → phases → target in one frame) and [`Plans/THREADING_MIGRATION_PLAN.md`](Plans/THREADING_MIGRATION_PLAN.md) for the authoritative plan.
+See [`Plans/Completed/threading_model_overview.svg`](Plans/Completed/threading_model_overview.svg) for the full picture (current → phases → target in one frame) and [`Plans/Completed/THREADING_MIGRATION_PLAN.md`](Plans/Completed/THREADING_MIGRATION_PLAN.md) for the historical migration plan (now complete).
 
 ### The invariant (non-negotiable)
 
@@ -130,6 +130,30 @@ Only the cycle-worker failure mode is survivable: back-pressure drops the *next*
 - Adding a new UI command that changes pipeline behavior: define a method on `IPipelineIntents`, push from the command, drain at the start of the cycle.
 - Adding a new service that reads GPS/position: take `*WorkingState` as a parameter, don't inject `ApplicationState`.
 - Avoid writing to `State.YouTurn`, `State.Guidance`, `State.Vehicle`, `State.Section` from anywhere except `ApplyGpsCycleResult`.
+
+## Persisted numeric / date strings
+
+Anything that lands on disk or on a wire (file I/O, NMEA / PGN packets,
+NTRIP HTTP, AgShare uploads, ISO-XML, UDP) **must** format and parse
+numbers and dates with `CultureInfo.InvariantCulture`. Without it,
+`(42.0308).ToString("F8")` produces `"42,03080000"` in fi-FI / sv-SE /
+de-DE / ..., which can break GPS NMEA parsing, PGN packet construction,
+saved field metadata, or any other code that round-trips strings
+between machines or processes.
+
+The `CA1305` analyzer (`Specify IFormatProvider`) fences this. It is
+enabled solution-wide as a **warning** for visibility, and promoted to
+**error** in the persistence- and wire-format-shaped paths via
+`.editorconfig` globs (`Services/Fields/`, `Services/AgShare/`,
+`Services/IsoXml/`, `Services/Tram/`, `Services/Pipeline/`,
+`Services/AutoSteer/PgnBuilder.cs`, `Services/NmeaParser*.cs`,
+`Services/NtripClientService.cs`, `Services/FieldPlaneFileService.cs`,
+`Simulators/**/Modules/`).
+
+If you add a new persistence sink, either drop it under one of those
+folders or extend the `.editorconfig` glob list. UI display code is
+free to use `CurrentCulture` (be explicit about it though — pin one
+or the other, never the implicit default).
 
 ## What Needs Doing
 

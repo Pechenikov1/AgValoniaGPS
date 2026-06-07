@@ -15,6 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 using System;
+using System.Collections.Generic;
 using CommunityToolkit.Mvvm.ComponentModel;
 
 namespace AgValoniaGPS.Models.State;
@@ -25,6 +26,11 @@ namespace AgValoniaGPS.Models.State;
 /// </summary>
 public class UIState : ObservableObject
 {
+    // Back-stack of parent dialogs in the current navigation chain. Only the
+    // chain dialog layers live here; the chain's originating left-nav fly-out is
+    // tracked separately in the ViewModel (it is not a DialogType).
+    private readonly Stack<DialogType> _dialogStack = new();
+
     // Active dialog (only one modal at a time)
     private DialogType _activeDialog = DialogType.None;
     public DialogType ActiveDialog
@@ -40,8 +46,11 @@ public class UIState : ObservableObject
                 // Raise property changed for all dialog visibility properties
                 OnPropertyChanged(nameof(IsDialogOpen));
                 OnPropertyChanged(nameof(IsFieldSelectionDialogVisible));
+                OnPropertyChanged(nameof(IsStartWorkSessionDialogVisible));
+                OnPropertyChanged(nameof(IsResumeJobDialogVisible));
                 OnPropertyChanged(nameof(IsTracksDialogVisible));
-                OnPropertyChanged(nameof(IsConfigurationDialogVisible));
+                OnPropertyChanged(nameof(IsVehicleConfigDialogVisible));
+                OnPropertyChanged(nameof(IsToolConfigDialogVisible));
                 OnPropertyChanged(nameof(IsNewFieldDialogVisible));
                 OnPropertyChanged(nameof(IsFromExistingFieldDialogVisible));
                 OnPropertyChanged(nameof(IsKmlImportDialogVisible));
@@ -58,7 +67,6 @@ public class UIState : ObservableObject
                 OnPropertyChanged(nameof(IsNtripProfileEditorDialogVisible));
                 OnPropertyChanged(nameof(IsConfirmationDialogVisible));
                 OnPropertyChanged(nameof(IsErrorDialogVisible));
-                OnPropertyChanged(nameof(IsAppDirectoriesDialogVisible));
                 OnPropertyChanged(nameof(IsHotkeyConfigDialogVisible));
                 OnPropertyChanged(nameof(IsAboutDialogVisible));
                 OnPropertyChanged(nameof(IsLogViewerDialogVisible));
@@ -73,6 +81,9 @@ public class UIState : ObservableObject
                 OnPropertyChanged(nameof(IsFieldBuilderDialogVisible));
                 OnPropertyChanged(nameof(IsBugReportDialogVisible));
                 OnPropertyChanged(nameof(IsSmartWasDialogVisible));
+                OnPropertyChanged(nameof(IsLoadVehicleToolDialogVisible));
+                OnPropertyChanged(nameof(IsAppSettingsDialogVisible));
+                OnPropertyChanged(nameof(IsUnsavedCoverageDialogVisible));
 
                 DialogChanged?.Invoke(this, new DialogChangedEventArgs(previous, value));
             }
@@ -83,8 +94,11 @@ public class UIState : ObservableObject
 
     // Convenience properties for XAML binding (backwards compatible)
     public bool IsFieldSelectionDialogVisible => ActiveDialog == DialogType.FieldSelection;
+    public bool IsStartWorkSessionDialogVisible => ActiveDialog == DialogType.StartWorkSession;
+    public bool IsResumeJobDialogVisible => ActiveDialog == DialogType.ResumeJob;
     public bool IsTracksDialogVisible => ActiveDialog == DialogType.Tracks;
-    public bool IsConfigurationDialogVisible => ActiveDialog == DialogType.Configuration;
+    public bool IsVehicleConfigDialogVisible => ActiveDialog == DialogType.VehicleConfig;
+    public bool IsToolConfigDialogVisible => ActiveDialog == DialogType.ToolConfig;
     public bool IsNewFieldDialogVisible => ActiveDialog == DialogType.NewField;
     public bool IsFromExistingFieldDialogVisible => ActiveDialog == DialogType.FromExistingField;
     public bool IsKmlImportDialogVisible => ActiveDialog == DialogType.KmlImport;
@@ -101,7 +115,6 @@ public class UIState : ObservableObject
     public bool IsNtripProfileEditorDialogVisible => ActiveDialog == DialogType.NtripProfileEditor;
     public bool IsConfirmationDialogVisible => ActiveDialog == DialogType.Confirmation;
     public bool IsErrorDialogVisible => ActiveDialog == DialogType.Error;
-    public bool IsAppDirectoriesDialogVisible => ActiveDialog == DialogType.AppDirectories;
     public bool IsHotkeyConfigDialogVisible => ActiveDialog == DialogType.HotkeyConfig;
     public bool IsAboutDialogVisible => ActiveDialog == DialogType.About;
     public bool IsLogViewerDialogVisible => ActiveDialog == DialogType.LogViewer;
@@ -116,6 +129,9 @@ public class UIState : ObservableObject
     public bool IsFieldBuilderDialogVisible => ActiveDialog == DialogType.FieldBuilder;
     public bool IsBugReportDialogVisible => ActiveDialog == DialogType.BugReport;
     public bool IsSmartWasDialogVisible => ActiveDialog == DialogType.SmartWas;
+    public bool IsLoadVehicleToolDialogVisible => ActiveDialog == DialogType.LoadVehicleTool;
+    public bool IsAppSettingsDialogVisible => ActiveDialog == DialogType.AppSettings;
+    public bool IsUnsavedCoverageDialogVisible => ActiveDialog == DialogType.UnsavedCoverage;
 
     // Panel visibility (non-modal, can have multiple open)
     private bool _isSimulatorPanelVisible;
@@ -185,8 +201,37 @@ public class UIState : ObservableObject
         ActiveDialog = dialog;
     }
 
+    /// <summary>
+    /// Push the current dialog (if any) onto the back-stack and show the next one.
+    /// Use for chain navigation so <see cref="GoBack"/> can return to the parent.
+    /// </summary>
+    public void PushDialog(DialogType dialog)
+    {
+        if (_activeDialog != DialogType.None)
+            _dialogStack.Push(_activeDialog);
+        ActiveDialog = dialog;
+    }
+
+    /// <summary>
+    /// Pop back to the previous dialog in the chain. Returns true if a parent
+    /// dialog was surfaced; false if the stack was empty (the caller then reopens
+    /// the originating fly-out).
+    /// </summary>
+    public bool GoBack()
+    {
+        if (_dialogStack.Count > 0)
+        {
+            ActiveDialog = _dialogStack.Pop();
+            return true;
+        }
+        ActiveDialog = DialogType.None;
+        SelectedItem = null;
+        return false;
+    }
+
     public void CloseDialog()
     {
+        _dialogStack.Clear();
         ActiveDialog = DialogType.None;
         SelectedItem = null;
     }
@@ -214,7 +259,8 @@ public enum DialogType
     None,
     FieldSelection,
     Tracks,
-    Configuration,
+    VehicleConfig,
+    ToolConfig,
     NewField,
     FromExistingField,
     KmlImport,
@@ -233,7 +279,6 @@ public enum DialogType
     NtripProfileEditor,
     Confirmation,
     Error,
-    AppDirectories,
     HotkeyConfig,
     About,
     LogViewer,
@@ -247,7 +292,12 @@ public enum DialogType
     TramSettings,
     FieldBuilder,
     BugReport,
-    SmartWas
+    SmartWas,
+    LoadVehicleTool,
+    StartWorkSession,
+    ResumeJob,
+    AppSettings,
+    UnsavedCoverage,
 }
 
 /// <summary>

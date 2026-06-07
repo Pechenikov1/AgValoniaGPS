@@ -42,6 +42,46 @@ public class TrackGuidanceService : ITrackGuidanceService
     /// <returns>Guidance output with steering angle and state</returns>
     public TrackGuidanceOutput CalculateGuidance(TrackGuidanceInput input)
     {
+        // PERF-05 #4 (track-side). Cycle = one CalculateGuidance call from
+        // GpsPipelineService.ProcessCycle. Marker: .perf_guidance (shared with
+        // YouTurnGuidanceService). Emits [TrackGuidance-PERF] at 1 Hz.
+        bool perf = AgValoniaGPS.Models.Diagnostics.DiagFlags.PerfGuidance;
+        if (!perf) return CalculateGuidanceCore(input);
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        long a0 = GC.GetAllocatedBytesForCurrentThread();
+        try { return CalculateGuidanceCore(input); }
+        finally
+        {
+            _perfCycleTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+            _perfCycleAllocs += GC.GetAllocatedBytesForCurrentThread() - a0;
+            _perfCycleCount++;
+            var elapsed = (DateTime.UtcNow - _perfWindowStart).TotalSeconds;
+            if (elapsed >= 1.0 && _perfCycleCount > 0)
+            {
+                double ticksPerUs = System.Diagnostics.Stopwatch.Frequency / 1_000_000.0;
+                Console.WriteLine(
+                    $"[TrackGuidance-PERF] cycles={_perfCycleCount}"
+                    + $" us/cycle={(_perfCycleTicks / ticksPerUs / _perfCycleCount):F1}"
+                    + $" alloc/cycle={(_perfCycleAllocs / _perfCycleCount)}B"
+                    + $" total_us={(long)(_perfCycleTicks / ticksPerUs)}"
+                    + $" total_alloc={_perfCycleAllocs}B"
+                    + $" window={elapsed:F2}s");
+                _perfCycleTicks = 0;
+                _perfCycleAllocs = 0;
+                _perfCycleCount = 0;
+                _perfWindowStart = DateTime.UtcNow;
+            }
+        }
+    }
+
+    // PERF-05 #4 accumulators (gated by DiagFlags.PerfGuidance).
+    private long _perfCycleTicks;
+    private long _perfCycleAllocs;
+    private int _perfCycleCount;
+    private DateTime _perfWindowStart = DateTime.UtcNow;
+
+    private TrackGuidanceOutput CalculateGuidanceCore(TrackGuidanceInput input)
+    {
         var output = new TrackGuidanceOutput
         {
             GoalPoint = new Vec2(),
@@ -107,7 +147,19 @@ public class TrackGuidanceService : ITrackGuidanceService
         double headingDiff = input.PivotPosition.Heading - segmentHeading;
         while (headingDiff > Math.PI) headingDiff -= TwoPI;
         while (headingDiff < -Math.PI) headingDiff += TwoPI;
-        bool isHeadingSameWay = Math.Abs(headingDiff) < PIBy2;
+        bool computedSameWay = Math.Abs(headingDiff) < PIBy2;
+
+        // Freeze the travel-direction decision while actively steering: only
+        // (re)evaluate it on acquire / global re-acquire (engage or a pipeline-
+        // detected direction flip) or when not steering. Recomputing every frame
+        // from the instantaneous nearest point let a momentarily-behind point flip
+        // the direction mid-curve, which steered the vehicle away and spun it (#422).
+        // Mirrors AgOpenGPS CABCurve's throttled isHeadingSameWay.
+        bool isHeadingSameWay =
+            (input.IsAutoSteerOn && !input.FindGlobalNearest && input.PreviousState != null)
+                ? input.PreviousState.IsHeadingSameWay
+                : computedSameWay;
+        output.State.IsHeadingSameWay = isHeadingSameWay;
 
         // Now determine effective heading direction using the locally calculated value
         bool reverseHeading = input.IsReverse ? !isHeadingSameWay : isHeadingSameWay;
@@ -503,10 +555,21 @@ public class TrackGuidanceService : ITrackGuidanceService
         }
         else
         {
-            // Local search - check segments around current index
+            // Local search - check segments around current index.
             int searchRadius = (int)(searchDistance / 2) + 8; // Approximate segment count to check
+
+            // Anti-loop-jump guard (#422): on a closed/curved track, two parts of the
+            // loop can pass close to each other, so the perpendicular-nearest segment in
+            // the window may sit on the *other* side of the loop. Jumping there strands
+            // the index and flips the travel direction → the vehicle spins. So we track
+            // the best candidate NEAR the current index separately and only accept a
+            // far jump if it is decisively closer (>20%). Mirrors AgOpenGPS's penalized
+            // backward jump. The near window still allows normal forward advance.
+            const int nearRadius = 3;
             double minDist = double.MaxValue;
             int nearestSegment = currentIndex;
+            double nearMinDist = double.MaxValue;
+            int nearSegment = currentIndex;
 
             for (int offset = -searchRadius; offset <= searchRadius; offset++)
             {
@@ -527,9 +590,20 @@ public class TrackGuidanceService : ITrackGuidanceService
                     minDist = dist;
                     nearestSegment = segIdx;
                 }
+                if (Math.Abs(offset) <= nearRadius && dist < nearMinDist)
+                {
+                    nearMinDist = dist;
+                    nearSegment = segIdx;
+                }
             }
 
-            return (nearestSegment, (nearestSegment + 1) % points.Count);
+            // Reject a far jump that isn't decisively closer than staying near the
+            // current index.
+            int chosen = (nearestSegment != nearSegment && minDist >= nearMinDist * 0.8)
+                ? nearSegment
+                : nearestSegment;
+
+            return (chosen, (chosen + 1) % points.Count);
         }
     }
 

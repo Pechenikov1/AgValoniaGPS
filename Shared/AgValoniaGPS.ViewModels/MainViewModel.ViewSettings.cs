@@ -17,6 +17,7 @@
 using System;
 using AgValoniaGPS.Models;
 using AgValoniaGPS.Models.Configuration;
+using AgValoniaGPS.Models.State;
 using AgValoniaGPS.Services;
 using Avalonia.Threading;
 
@@ -27,18 +28,18 @@ namespace AgValoniaGPS.ViewModels;
 
 /// <summary>
 /// MainViewModel partial class containing View Settings and Panel Visibility.
-/// Manages UI state for panels, display settings, and camera/brightness controls.
+/// Manages UI state for panels, display settings, and camera/display controls.
 /// </summary>
 public partial class MainViewModel
 {
     #region Panel Visibility Fields
 
-    private bool _isViewSettingsPanelVisible;
+    private bool _isScreenAlertsPanelVisible;
     private bool _isFileMenuPanelVisible;
     private bool _isToolsPanelVisible;
-    private bool _isConfigurationPanelVisible;
-    private bool _isJobMenuPanelVisible;
+    private bool _isFieldOperationsPanelVisible;
     private bool _isFieldToolsPanelVisible;
+    private bool _isNetworkIoPanelVisible;
     private bool _isSimulatorPanelVisible;
     private bool _isSteerChartPanelVisible;
     private bool _isHeadingChartPanelVisible;
@@ -48,41 +49,48 @@ public partial class MainViewModel
 
     #region Panel Visibility Properties
 
-    public bool IsViewSettingsPanelVisible
+    public bool IsScreenAlertsPanelVisible
     {
-        get => _isViewSettingsPanelVisible;
-        set => SetProperty(ref _isViewSettingsPanelVisible, value);
+        get => _isScreenAlertsPanelVisible;
+        set { SetProperty(ref _isScreenAlertsPanelVisible, value); OnPropertyChanged(nameof(IsAnyNavFlyoutOpen)); }
     }
 
     public bool IsFileMenuPanelVisible
     {
         get => _isFileMenuPanelVisible;
-        set => SetProperty(ref _isFileMenuPanelVisible, value);
+        set { SetProperty(ref _isFileMenuPanelVisible, value); OnPropertyChanged(nameof(IsAnyNavFlyoutOpen)); }
     }
 
     public bool IsToolsPanelVisible
     {
         get => _isToolsPanelVisible;
-        set => SetProperty(ref _isToolsPanelVisible, value);
+        set { SetProperty(ref _isToolsPanelVisible, value); OnPropertyChanged(nameof(IsAnyNavFlyoutOpen)); }
     }
 
-    public bool IsConfigurationPanelVisible
+    public bool IsFieldOperationsPanelVisible
     {
-        get => _isConfigurationPanelVisible;
-        set => SetProperty(ref _isConfigurationPanelVisible, value);
-    }
-
-    public bool IsJobMenuPanelVisible
-    {
-        get => _isJobMenuPanelVisible;
-        set => SetProperty(ref _isJobMenuPanelVisible, value);
+        get => _isFieldOperationsPanelVisible;
+        set { SetProperty(ref _isFieldOperationsPanelVisible, value); OnPropertyChanged(nameof(IsAnyNavFlyoutOpen)); }
     }
 
     public bool IsFieldToolsPanelVisible
     {
         get => _isFieldToolsPanelVisible;
-        set => SetProperty(ref _isFieldToolsPanelVisible, value);
+        set { SetProperty(ref _isFieldToolsPanelVisible, value); OnPropertyChanged(nameof(IsAnyNavFlyoutOpen)); }
     }
+
+    public bool IsNetworkIoPanelVisible
+    {
+        get => _isNetworkIoPanelVisible;
+        set { SetProperty(ref _isNetworkIoPanelVisible, value); OnPropertyChanged(nameof(IsAnyNavFlyoutOpen)); }
+    }
+
+    /// <summary>True while any left-nav fly-out is open. Drives the light-dismiss
+    /// scrim that closes the open menu when the operator taps outside it.</summary>
+    public bool IsAnyNavFlyoutOpen =>
+        IsScreenAlertsPanelVisible || IsFileMenuPanelVisible || IsToolsPanelVisible
+        || IsFieldOperationsPanelVisible || IsFieldToolsPanelVisible
+        || IsNetworkIoPanelVisible;
 
     public bool IsSimulatorPanelVisible
     {
@@ -108,6 +116,27 @@ public partial class MainViewModel
         set => SetProperty(ref _isXTEChartPanelVisible, value);
     }
 
+    /// <summary>
+    /// Close every left-nav fly-out menu. Used to enforce "one menu open at a
+    /// time" (a toggle closes the others first) and to dismiss the open menu
+    /// when one of its items launches a dialog.
+    /// </summary>
+    public void CloseAllNavFlyouts()
+    {
+        // Remember which fly-out we're closing so a chain dialog launched by the
+        // same item-click can still capture it as its origin (see OpenChainDialog).
+        var open = CurrentFlyout();
+        if (open != NavFlyout.None)
+            _lastClosedFlyout = open;
+
+        IsScreenAlertsPanelVisible = false;
+        IsFileMenuPanelVisible = false;
+        IsToolsPanelVisible = false;
+        IsFieldOperationsPanelVisible = false;
+        IsFieldToolsPanelVisible = false;
+        IsNetworkIoPanelVisible = false;
+    }
+
     #endregion
 
     #region Clock
@@ -131,8 +160,8 @@ public partial class MainViewModel
 
     #region Camera Mode
 
-    private CameraMode _cameraMode = CameraMode.HeadingUp;
-    private CameraMode _previousCameraMode = CameraMode.HeadingUp;
+    private CameraMode _cameraMode = CameraMode.Map;
+    private CameraMode _previousCameraMode = CameraMode.Map;
     public CameraMode CameraMode
     {
         get => _cameraMode;
@@ -152,19 +181,38 @@ public partial class MainViewModel
     {
         CameraMode.NorthUp => "N",
         CameraMode.HeadingUp => "H",
+        CameraMode.Map => "M",
         CameraMode.Free => "C",  // "Center" -- tap to recenter on vehicle
         _ => "?"
     };
 
+    /// <summary>
+    /// Fires OnPropertyChanged for the display-bound properties that
+    /// ConfigurationService loaded directly into <see cref="_displaySettings"/>
+    /// at startup (bypassing the property setters and their automatic
+    /// notification). Called once from each platform's view code-behind
+    /// after MapControl registration so the display panel binding picks up
+    /// the saved values instead of staying on its empty/default state.
+    /// </summary>
+    public void NotifyDisplayLabelsAfterStartup()
+    {
+        OnPropertyChanged(nameof(CameraPitch));
+        OnPropertyChanged(nameof(CameraPitchDisplay));
+        OnPropertyChanged(nameof(Is2DMode));
+        OnPropertyChanged(nameof(CameraMode));
+        OnPropertyChanged(nameof(CameraModeLabel));
+    }
+
     private void ApplyCameraMode()
     {
-        // Set camera follow mode directly on map control: 0=NorthUp, 1=HeadingUp, 2=Free
+        // Set camera follow mode directly on map control: 0=NorthUp, 1=HeadingUp, 2=Free, 3=Map
         int mapMode = _cameraMode switch
         {
             CameraMode.NorthUp => 0,
             CameraMode.HeadingUp => 1,
             CameraMode.Free => 2,
-            _ => 0
+            CameraMode.Map => 3,
+            _ => 3
         };
         var camPos = _mapService.GetCameraCenter();
         Console.WriteLine($"[Camera] ApplyCameraMode: {_cameraMode} (mapMode={mapMode}) cam=({camPos.X:F1},{camPos.Y:F1}) vehicle=({Easting:F1},{Northing:F1})");
@@ -178,6 +226,11 @@ public partial class MainViewModel
         }
 
         IsNorthUp = _cameraMode == CameraMode.NorthUp;
+
+        // Persist last actively-chosen follow mode (Free is transient -- entered by
+        // pan, not a mode the user explicitly picks to keep). State, not config.
+        if (_cameraMode != CameraMode.Free)
+            PersistentState.CameraMode = _cameraMode;
     }
 
     /// <summary>
@@ -270,21 +323,6 @@ public partial class MainViewModel
         }
     }
 
-    public int Brightness
-    {
-        get => _displaySettings.Brightness;
-        set
-        {
-            _displaySettings.Brightness = value;
-            OnPropertyChanged();
-            OnPropertyChanged(nameof(BrightnessDisplay));
-        }
-    }
-
-    public string BrightnessDisplay => _displaySettings.IsBrightnessSupported
-        ? $"{_displaySettings.Brightness}%"
-        : "??";
-
     public string DisplayResolutionLabel => ConfigStore.Display.DisplayResolutionMultiplier switch
     {
         < 1.25 => "Ultra",
@@ -352,19 +390,154 @@ public partial class MainViewModel
     #region ConfigurationStore Display Forwarding
 
     /// <summary>
-    /// UTurn button visible when track available AND config allows it.
+    /// UTurn button visible when track available AND config allows it AND the
+    /// active track isn't a closed loop (no U-turns on polygon tracks, #421).
     /// </summary>
     public bool IsUTurnButtonVisible =>
-        IsAutoSteerAvailable && ConfigurationStore.Instance.Display.UTurnButtonVisible;
+        IsAutoSteerAvailable && ConfigurationStore.Instance.Display.UTurnButtonVisible
+        && !IsActiveTrackClosed;
 
     /// <summary>
-    /// Notify IsUTurnButtonVisible when IsAutoSteerAvailable changes.
-    /// Called from MainViewModel.Guidance.cs when track state changes.
+    /// Manual U-turn left/right buttons: visible only while steering AND not on a
+    /// closed (polygon) track (#421).
+    /// </summary>
+    public bool IsManualUTurnVisible => IsAutoSteerEngaged && !IsActiveTrackClosed;
+
+    /// <summary>
+    /// On-map U-Turn overlay (the two yellow manual-turn arrows). Same conditions
+    /// as the manual U-turn buttons, additionally gated by the Screen &amp; Alerts
+    /// "U-Turn" on-screen-button toggle (<see cref="DisplayConfig.UTurnButtonVisible"/>).
+    /// </summary>
+    public bool IsUTurnOverlayVisible =>
+        ConfigurationStore.Instance.Display.UTurnButtonVisible && IsManualUTurnVisible;
+
+    /// <summary>
+    /// On-map Lateral overlay (the two cyan shift arrows). Shown only while
+    /// autosteer is engaged (same gate as the U-turn overlay), additionally
+    /// gated by the Screen &amp; Alerts "Lateral" on-screen-button toggle
+    /// (<see cref="DisplayConfig.LateralButtonVisible"/>) — previously orphaned.
+    /// </summary>
+    public bool IsLateralOverlayVisible =>
+        ConfigurationStore.Instance.Display.LateralButtonVisible && IsManualUTurnVisible;
+
+    /// <summary>
+    /// Notify IsUTurnButtonVisible and the on-map overlay visibilities when their
+    /// inputs change. Called from MainViewModel.Guidance.cs when track state
+    /// changes and from the ConfigStore.Display subscription when the on-screen-
+    /// button toggles flip.
     /// </summary>
     private void RaiseUTurnButtonVisibleChanged()
     {
         OnPropertyChanged(nameof(IsUTurnButtonVisible));
+        OnPropertyChanged(nameof(IsUTurnOverlayVisible));
+        OnPropertyChanged(nameof(IsLateralOverlayVisible));
     }
+
+    /// <summary>
+    /// Aggregate of the four module-status flags shown in the top status strip,
+    /// replacing the per-letter G/I/A/M cluster. Configured set comes from
+    /// <see cref="ConnectionConfig.IsGpsConfigured"/> etc.; presence comes from
+    /// <see cref="ConnectionState.IsGpsDataOk"/> etc.
+    /// </summary>
+    public ModuleStatusKind ModuleStatusKind
+    {
+        get
+        {
+            var cfg = ConfigurationStore.Instance.Connections;
+            var st = State.Connections;
+            int configured = 0;
+            int present = 0;
+
+            if (cfg.IsGpsConfigured)       { configured++; if (st.IsGpsDataOk)       present++; }
+            if (cfg.IsImuConfigured)       { configured++; if (st.IsImuDataOk)       present++; }
+            if (cfg.IsAutoSteerConfigured) { configured++; if (st.IsAutoSteerDataOk) present++; }
+            if (cfg.IsMachineConfigured)   { configured++; if (st.IsMachineDataOk)   present++; }
+
+            if (configured == 0 || present == 0) return ModuleStatusKind.NonePresent;
+            if (present == configured) return ModuleStatusKind.AllPresent;
+            return ModuleStatusKind.PartiallyPresent;
+        }
+    }
+
+    private void RaiseModuleStatusKindChanged()
+    {
+        OnPropertyChanged(nameof(ModuleStatusKind));
+    }
+
+    /// <summary>
+    /// On-map Dev overlay (FPS / Latency / Lat / Lon). Read once at startup
+    /// from a file-flag in the AgValoniaGPS Documents folder so the toggle
+    /// works on iPad/Android (where hotkeys aren't available) without
+    /// surfacing in the UI.
+    /// </summary>
+    public bool IsDevOverlayVisible { get; } = Services.DevOverlayMarker.IsEnabled();
+
+    private BatteryStatus _batteryStatus;
+
+    /// <summary>
+    /// Latest battery reading from the per-platform <see cref="IBatteryService"/>.
+    /// The status-strip battery icon binds to the derived properties below.
+    /// </summary>
+    public BatteryStatus BatteryStatus => _batteryStatus;
+
+    /// <summary>Battery level as a 0-1 fraction. Meaningless when <see cref="IsBatteryAvailable"/> is false.</summary>
+    public double BatteryLevel => _batteryStatus.Level;
+
+    /// <summary>True when the device is currently plugged in.</summary>
+    public bool IsBatteryCharging => _batteryStatus.IsCharging;
+
+    /// <summary>True when the platform exposed a real reading. The icon hides when this is false.</summary>
+    public bool IsBatteryAvailable => _batteryStatus.IsAvailable;
+
+    /// <summary>
+    /// On-map field-stats detail card. Replaces the old auto-show-when-active
+    /// top-right strip; toggled from the strip button. Persists via
+    /// <see cref="DisplayConfig.FieldStatsOnMapVisible"/>.
+    /// </summary>
+    public bool IsFieldStatsOnMapVisible
+    {
+        get => ConfigurationStore.Instance.Display.FieldStatsOnMapVisible;
+        set
+        {
+            if (ConfigurationStore.Instance.Display.FieldStatsOnMapVisible != value)
+            {
+                ConfigurationStore.Instance.Display.FieldStatsOnMapVisible = value;
+                OnPropertyChanged();
+                _settingsService.Save();
+            }
+        }
+    }
+
+    /// <summary>Strip button: flips <see cref="IsFieldStatsOnMapVisible"/>.</summary>
+    public CommunityToolkit.Mvvm.Input.IRelayCommand ToggleFieldStatsOnMapCommand =>
+        _toggleFieldStatsOnMapCommand ??= new CommunityToolkit.Mvvm.Input.RelayCommand(
+            () => IsFieldStatsOnMapVisible = !IsFieldStatsOnMapVisible);
+    private CommunityToolkit.Mvvm.Input.IRelayCommand? _toggleFieldStatsOnMapCommand;
+
+    /// <summary>
+    /// On-map GPS detail card. Toggled by tapping the strip's Modules
+    /// aggregate button (the button still shows the aggregate dot colour).
+    /// Shares the on-map slot with the Field-Stats card.
+    /// </summary>
+    public bool IsGpsDetailOverlayVisible
+    {
+        get => ConfigurationStore.Instance.Display.GpsDetailOverlayVisible;
+        set
+        {
+            if (ConfigurationStore.Instance.Display.GpsDetailOverlayVisible != value)
+            {
+                ConfigurationStore.Instance.Display.GpsDetailOverlayVisible = value;
+                OnPropertyChanged();
+                _settingsService.Save();
+            }
+        }
+    }
+
+    /// <summary>Modules button: flips <see cref="IsGpsDetailOverlayVisible"/>.</summary>
+    public CommunityToolkit.Mvvm.Input.IRelayCommand ToggleGpsDetailOverlayCommand =>
+        _toggleGpsDetailOverlayCommand ??= new CommunityToolkit.Mvvm.Input.RelayCommand(
+            () => IsGpsDetailOverlayVisible = !IsGpsDetailOverlayVisible);
+    private CommunityToolkit.Mvvm.Input.IRelayCommand? _toggleGpsDetailOverlayCommand;
 
     #endregion
 }

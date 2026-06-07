@@ -25,10 +25,13 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using AgValoniaGPS.Models;
 using AgValoniaGPS.Models.Base;
+using AgValoniaGPS.Models.Job;
 using AgValoniaGPS.Models.Guidance;
 using AgValoniaGPS.Models.Pipeline;
+using AgValoniaGPS.Models.Timing;
 using AgValoniaGPS.Models.YouTurn;
 using AgValoniaGPS.Services;
+using AgValoniaGPS.Services.Fields;
 using AgValoniaGPS.Services.YouTurn;
 using AgValoniaGPS.Services.Interfaces;
 using AgValoniaGPS.Models.GPS;
@@ -53,6 +56,8 @@ public partial class MainViewModel : ObservableObject
     private readonly AgValoniaGPS.Services.Interfaces.IFieldStatisticsService _fieldStatistics;
     private readonly AgValoniaGPS.Services.Interfaces.IGpsSimulationService _simulatorService;
     private readonly ISettingsService _settingsService;
+    private readonly IPersistentStateService _persistentStateService;
+    private readonly IBatteryService _batteryService;
     private readonly IMapService _mapService;
     private readonly IBoundaryRecordingService _boundaryRecordingService;
     private readonly IBoundaryBuilderService _boundaryBuilderService;
@@ -78,14 +83,22 @@ public partial class MainViewModel : ObservableObject
     private readonly IChartDataService _chartDataService;
     private readonly IAudioService _audioService;
     private readonly IElevationLogService _elevationLogService;
+    private readonly IJobService _jobService;
     private readonly ITramLineService _tramLineService;
     private bool _hasTramSystemsEverUsed;
     private readonly Dictionary<string, (int start, int count, bool isBoundary)> _tramSystemLineRanges = new();
     private readonly IGpsPipelineService _gpsPipelineService;
+    private readonly ISteerMachineLoopService? _controlLoop;
+    private readonly IPositionEstimator? _positionEstimator;
     private readonly IPipelineIntents _intents;
     private readonly ILogger<MainViewModel> _logger;
     private readonly ApplicationState _appState;
     private readonly Avalonia.Threading.DispatcherTimer _simulatorTimer;
+    private Avalonia.Threading.DispatcherTimer? _renderPullTimer;
+    // PERF-05 Phase 2c #2: unified 5 Hz status-display tick, decoupled from
+    // every data source (GPS 10 Hz, control loop 100 Hz, AutoSteer 100 Hz).
+    // Drives every MainViewModel property bound to the top status bar.
+    private Avalonia.Threading.DispatcherTimer? _statusTickTimer;
 
     /// <summary>
     /// Centralized application state - single source of truth for all runtime state.
@@ -93,6 +106,14 @@ public partial class MainViewModel : ObservableObject
     /// </summary>
     public ApplicationState State => _appState;
     public DisplayConfig Display => ConfigurationStore.Instance.Display;
+
+    /// <summary>
+    /// Persistent application state — window/last-view/last-field/sim position
+    /// and other "where the app was" values that survive restart via
+    /// appstate.json. Distinct from <see cref="State"/> (ephemeral) and
+    /// configuration. Same object as <see cref="PersistentAppState.Instance"/>.
+    /// </summary>
+    public PersistentAppState PersistentState => PersistentAppState.Instance;
 
     // Convenience accessors for ConfigurationStore (replaces _vehicleConfig usage)
     private static ConfigurationStore ConfigStore => ConfigurationStore.Instance;
@@ -195,14 +216,38 @@ public partial class MainViewModel : ObservableObject
         IChartDataService chartDataService,
         IAudioService audioService,
         IElevationLogService elevationLogService,
+        IJobService jobService,
         ITramLineService tramLineService,
         IGpsPipelineService gpsPipelineService,
         IPipelineIntents intents,
         ILogger<MainViewModel> logger,
-        ApplicationState appState)
+        ApplicationState appState,
+        IPersistentStateService persistentStateService,
+        IBatteryService batteryService,
+        ISteerMachineLoopService? controlLoop = null,
+        IPositionEstimator? positionEstimator = null)
     {
         _logger = logger;
+        _persistentStateService = persistentStateService;
+        _batteryService = batteryService;
         _tramLineService = tramLineService;
+
+        // Battery icon in the strip — start the per-platform reader, prime with
+        // its initial reading, and refresh on each StatusChanged notification.
+        _batteryService.StatusChanged += (_, status) =>
+        {
+            _batteryStatus = status;
+            OnPropertyChanged(nameof(BatteryStatus));
+            OnPropertyChanged(nameof(BatteryLevel));
+            OnPropertyChanged(nameof(IsBatteryCharging));
+            OnPropertyChanged(nameof(IsBatteryAvailable));
+        };
+        _batteryService.Start();
+        _batteryStatus = _batteryService.CurrentStatus;
+
+        // Status-strip rotator: cycles the bottom of the two-line text stack
+        // through field name / stats / AB-line every 5 s, with a pause button.
+        InitializeStatusStripRotation();
 
         // Sync GuidanceConfig.TramDisplay -> TramConfig.DisplayMode and regenerate
         ConfigStore.Guidance.PropertyChanged += (_, e) =>
@@ -218,6 +263,42 @@ public partial class MainViewModel : ObservableObject
             {
                 ConfigStore.Tram.Passes = ConfigStore.Guidance.TramPasses;
                 UpdateTramLines(SelectedTrack);
+            }
+        };
+
+        // The Screen & Alerts "On-Screen Buttons" toggles gate the on-map U-Turn
+        // and Lateral overlays. Refresh those computed visibilities when the user
+        // flips a toggle so the overlays appear/disappear live.
+        ConfigStore.Display.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(Models.Configuration.DisplayConfig.UTurnButtonVisible))
+            {
+                OnPropertyChanged(nameof(IsUTurnButtonVisible));
+                OnPropertyChanged(nameof(IsUTurnOverlayVisible));
+            }
+            else if (e.PropertyName == nameof(Models.Configuration.DisplayConfig.LateralButtonVisible))
+            {
+                OnPropertyChanged(nameof(IsLateralOverlayVisible));
+            }
+        };
+
+        // Aggregate module-status indicator (replaces the four-letter G/I/A/M
+        // cluster). Refresh when either the configured set or the live data-ok
+        // flags change. State.Connections is wired in the post-_appState block.
+        ConfigStore.Connections.PropertyChanged += (_, e) =>
+        {
+            switch (e.PropertyName)
+            {
+                case nameof(Models.Configuration.ConnectionConfig.IsGpsConfigured):
+                case nameof(Models.Configuration.ConnectionConfig.IsImuConfigured):
+                case nameof(Models.Configuration.ConnectionConfig.IsAutoSteerConfigured):
+                case nameof(Models.Configuration.ConnectionConfig.IsMachineConfigured):
+                    RaiseModuleStatusKindChanged();
+                    // Module-present checkboxes (Network IO panel) are persistent
+                    // config. Save on user change only — never during the initial
+                    // settings load (guarded by _configReady).
+                    if (_configReady) _configurationService.SaveAppSettings();
+                    break;
             }
         };
         _udpService = udpService;
@@ -241,6 +322,12 @@ public partial class MainViewModel : ObservableObject
         _turnAreaService = turnAreaService;
         _vehicleProfileService = vehicleProfileService;
         _configurationService = configurationService;
+        // Refresh status-bar bindings whenever the active profile changes
+        // (load / save / picker dialog) so labels like CurrentProfileName
+        // re-render. The store updates correctly on its own, but bindings
+        // through computed properties on this VM need an explicit notify.
+        _configurationService.ProfileLoaded += (_, _) => RaiseProfileNameChanged();
+        _configurationService.ProfileSaved += (_, _) => RaiseProfileNameChanged();
         _autoSteerService = autoSteerService;
         _smartWasService = smartWasService;
         _trackCopierService = trackCopierService;
@@ -252,10 +339,38 @@ public partial class MainViewModel : ObservableObject
         _chartDataService = chartDataService;
         _audioService = audioService;
         _elevationLogService = elevationLogService;
+        _jobService = jobService;
+        // Refresh the field/job pill + status strip whenever the active job
+        // changes (created, resumed, suspended).
+        _jobService.ActiveJobChanged += (_, _) =>
+        {
+            OnPropertyChanged(nameof(CurrentJobTaskName));
+            OnPropertyChanged(nameof(CurrentFieldAndJobLabel));
+            RaiseStatusStripChanged();
+        };
         _gpsPipelineService = gpsPipelineService;
+        _controlLoop = controlLoop;
+        _positionEstimator = positionEstimator;
         _intents = intents;
         _appState = appState;
         _fieldPlaneFileService = new FieldPlaneFileService();
+
+        // Live half of the aggregate module-status indicator (see the
+        // ConfigStore.Connections subscription above for the configured-set
+        // half). Only the four data-ok flags participate; IP and engaged flags
+        // do not affect the colour.
+        _appState.Connections.PropertyChanged += (_, e) =>
+        {
+            switch (e.PropertyName)
+            {
+                case nameof(Models.State.ConnectionState.IsGpsDataOk):
+                case nameof(Models.State.ConnectionState.IsImuDataOk):
+                case nameof(Models.State.ConnectionState.IsAutoSteerDataOk):
+                case nameof(Models.State.ConnectionState.IsMachineDataOk):
+                    RaiseModuleStatusKindChanged();
+                    break;
+            }
+        };
 
         // Subscribe to events
         _gpsService.GpsDataUpdated += OnGpsDataUpdated;
@@ -267,6 +382,65 @@ public partial class MainViewModel : ObservableObject
         // Start the background GPS processing pipeline
         _gpsPipelineService.CycleCompleted += OnGpsCycleCompleted;
         _gpsPipelineService.Start();
+
+        // Host control loop (#313): runs at 100 Hz on its own thread.
+        // Each tick: read interpolated pose from estimator, update tool
+        // position + section state machine, send PGN 254 + PGN 239. This
+        // gives sub-frame section edge accuracy (~0.05 m at 25 km/h vs
+        // ~0.7 m on the prior 10 Hz path) and matches the firmware
+        // autosteer cadence so PGNs land fresh every firmware tick.
+        // Optional in test builds.
+        if (_controlLoop is not null)
+        {
+            // TickHz is on the concrete SectionControlService, not the
+            // interface (it's an internal-tuning concern, not a contract).
+            if (_sectionControlService is Services.Section.SectionControlService scsConcrete)
+                scsConcrete.TickHz = _controlLoop.FrequencyHz;
+            _controlLoop.Ticked += OnControlLoopTicked;
+            _controlLoop.Start();
+        }
+
+        // Renderer-pull timer (#313 commit 6): when a position estimator is
+        // wired, push the latest dead-reckoned vehicle pose to the map at
+        // ~30 Hz so the chevron moves smoothly between GPS samples instead
+        // of stepping at the GPS rate (10 Hz). Pulled state, not pushed —
+        // the estimator's pose at any tick reflects the latest GPS snapshot
+        // dead-reckoned forward to that tick's timestamp.
+        if (_positionEstimator is not null)
+        {
+            // Render-pull rate. Each tick clones 5 arrays, allocates an ~80-field
+            // MapRenderState, and pushes it to the Avalonia composition thread —
+            // which on iOS Metal stays saturated at 30 Hz on weaker hardware
+            // (e.g. iPad Pro 2nd gen drops to 24 FPS during paint). Drop to
+            // ~20 Hz on mobile to give the composition thread headroom; desktop
+            // keeps 30 Hz for smoother vehicle interpolation.
+            int intervalMs = (OperatingSystem.IsIOS() || OperatingSystem.IsAndroid()) ? 50 : 33;
+            _renderPullTimer = new Avalonia.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(intervalMs),
+            };
+            _renderPullTimer.Tick += OnRenderPullTick;
+            _renderPullTimer.Start();
+        }
+
+        // PERF-05 Phase 2c #2. Unified 5 Hz status-display tick — the single
+        // cadence for every top-status-bar bound MainViewModel property,
+        // decoupled from every upstream source rate (GPS 10 Hz, control loop
+        // 100 Hz, AutoSteer 100 Hz). 5 Hz (200 ms) is below the human
+        // perception threshold for numeric text on a status bar and cuts the
+        // PropertyChanged → Avalonia binding → TextLayout cascade for every
+        // status value to the same predictable rate.
+        //
+        // Replaces Phase 2c #1's 10 Hz "display tick" — same architecture,
+        // half the rate, and now also includes diagnostics like
+        // GpsToPgnLatencyMs that AutoSteer was writing at 100 Hz.
+        // See Plans/perf_data/2026-05-20/ANALYSIS.md.
+        _statusTickTimer = new Avalonia.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(200),
+        };
+        _statusTickTimer.Tick += OnStatusTick;
+        _statusTickTimer.Start();
         _udpService.ModuleConnectionChanged += OnModuleConnectionChanged;
         _ntripService.ConnectionStatusChanged += OnNtripConnectionChanged;
         _ntripService.RtcmDataReceived += OnRtcmDataReceived;
@@ -280,6 +454,10 @@ public partial class MainViewModel : ObservableObject
         _sectionControlService.SectionStateChanged += OnSectionStateChanged;
         _coverageMapService.BoundsExpanded += OnCoverageBoundsExpanded;
 
+        // Build the initial section bar (rows + colors) from the seeded
+        // NumSections; subsequent NumSections changes rebuild it.
+        InitializeSectionBar();
+
         // Sync drift compensation to AutoSteerService when edited via TextBox
         State.Field.PropertyChanged += (s, e) =>
         {
@@ -288,6 +466,10 @@ public partial class MainViewModel : ObservableObject
                 _autoSteerService.SetDriftCompensation(State.Field.DriftEasting, State.Field.DriftNorthing);
             }
         };
+
+        // Wire YouTurn state -> IsUTurnDistanceVisible computed property
+        // so the right-panel distance widget shows during approach, not just mid-turn.
+        WireYouTurnDistanceVisibility();
 
         // Subscribe to ConfigurationStore changes to update NumSections
         _numSections = Models.Configuration.ConfigurationStore.Instance.NumSections;
@@ -304,6 +486,9 @@ public partial class MainViewModel : ObservableObject
                 OnPropertyChanged(nameof(BoundaryAreaDisplay));
                 OnPropertyChanged(nameof(WorkRateDisplay));
                 OnPropertyChanged(nameof(SimulatorSpeedDisplay));
+                OnPropertyChanged(nameof(SpeedLargeValue));
+                OnPropertyChanged(nameof(SpeedLargeUnit));
+                RaiseStatusStripChanged();
             }
         };
 
@@ -323,6 +508,7 @@ public partial class MainViewModel : ObservableObject
         _simulatorTimer.Tick += OnSimulatorTick;
 
         // Initialize commands (split into partial class files for organization)
+        InitializeChainNavigationCommands();
         InitializeNavigationCommands();
         InitializeSimulatorCommands();
         InitializeConfigurationCommands();
@@ -332,16 +518,23 @@ public partial class MainViewModel : ObservableObject
         InitializeTrackManagementCommands();
         InitializeRecordedPathCommands();
         InitializeNtripCommands();
+        InitializeNetworkIoCommands();
         InitializeWizardCommands();
         InitializeSettingsCommands();
         InitializeHotkeyCommands();
         InitializeChartCommands();
+        InitializeCoverageGuardCommands();
 
         // Load display settings first, then restore our app settings on top
         // This ensures AppSettings takes precedence over DisplaySettings
         // IMPORTANT: Run synchronously to ensure settings are loaded before any save can occur
         _displaySettings.LoadSettings();
         RestoreSettings();
+
+        // Settings are now loaded; subsequent ConnectionConfig changes are
+        // user-driven and should persist (see the ConfigStore.Connections
+        // subscription above).
+        _configReady = true;
 
         // Apply theme variant based on saved day/night mode
         ApplyThemeVariant(IsDayMode);
@@ -368,6 +561,143 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
+    /// <summary>
+    /// Host control loop tick handler (#313). Runs at 100 Hz on the loop's
+    /// own thread. Reads the latest GPS-anchored pose from the estimator,
+    /// updates tool position + section state machine, then sends PGN 254 +
+    /// PGN 239 so the firmware autosteer task — which also runs at 100 Hz
+    /// — sees fresh data every cycle.
+    /// </summary>
+    private void OnControlLoopTicked(long timestampTicks)
+    {
+        // Only run the section/tool pipeline once a GPS sample exists; before
+        // then the estimator returns default(InterpolatedPose) which would
+        // pin tool position at (0,0). Autosteer PGN sends are still useful
+        // before the first GPS sample (firmware needs to see SOMETHING to
+        // know we're alive), so they don't gate.
+        if (_positionEstimator?.GetLatestSnapshot() is not null)
+        {
+            var p = _positionEstimator.GetPose(timestampTicks);
+            _toolPositionService.Update(
+                new Vec3(p.Position.Easting, p.Position.Northing, p.Heading),
+                p.Heading);
+            _sectionControlService.Update(
+                _toolPositionService.ToolPosition,
+                _toolPositionService.ToolHeading,
+                p.Heading,
+                p.SpeedMps);
+        }
+        _autoSteerService.SendPgnsForControlTick();
+    }
+
+    /// <summary>
+    /// 30 Hz UI-thread pull (#313 commit 6) of the dead-reckoned vehicle
+    /// pose so the map chevron interpolates smoothly between GPS samples
+    /// instead of stepping at the GPS rate. The estimator returns a pose
+    /// dead-reckoned to "now" from the latest GPS snapshot using yaw rate
+    /// and velocity, so position advances ~7 cm per 30 Hz frame at 25 km/h
+    /// instead of a 28 cm jump every 100 ms.
+    ///
+    /// Tool/hitch are computed entirely from the current dead-reckoned
+    /// vehicle pose (for hitch) and the Torriem-stable tool heading from
+    /// the snapshot (for tool). Earlier attempts that translated the
+    /// snapshot tool by a dead-reckoned hitch delta still mixed two
+    /// estimator state bases when a GPS sample arrived between the last
+    /// control-loop tick and the render tick — the snapshot hitch used
+    /// the pre-arrival prediction while the new hitch used the post-
+    /// arrival prediction, leaking a small snap into the implement at
+    /// each sample. Computing both hitch and tool from the same single
+    /// estimator pose eliminates that.
+    /// </summary>
+    private void OnRenderPullTick(object? sender, EventArgs e)
+    {
+        if (_positionEstimator?.GetLatestSnapshot() is null)
+            return;
+
+        // PERF-05 #2: state-mirror cycle = one OnRenderPullTick after the
+        // early-return. Captures GetPose + SetAllPositions + SendStateToHandler.
+        bool sm = AgValoniaGPS.Models.Diagnostics.DiagFlags.PerfStateMirror;
+        long smT0 = sm ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        long smA0 = sm ? GC.GetAllocatedBytesForCurrentThread() : 0;
+
+        var p = _positionEstimator.GetPose(Clock.Current.GetTimestamp());
+
+        var tool = ConfigStore.Tool;
+        // Rigid tools use Tool.HitchLength (axle -> working center); trailing/TBT use
+        // Vehicle.HitchLength (axle -> tractor hitch pin). Matches ToolPositionService.
+        double hitchDistance = (tool.IsToolFrontFixed || tool.IsToolRearFixed)
+            ? Math.Abs(tool.HitchLength)
+            : Math.Abs(ConfigStore.Vehicle.HitchLength);
+        if (tool.IsToolRearFixed || tool.IsToolTrailing || tool.IsToolTBT)
+            hitchDistance = -hitchDistance;
+
+        double hitchE = p.Position.Easting + Math.Sin(p.Heading) * hitchDistance;
+        double hitchN = p.Position.Northing + Math.Cos(p.Heading) * hitchDistance;
+
+        double toolE, toolN, toolHeading;
+        if (tool.IsToolFrontFixed || tool.IsToolRearFixed)
+        {
+            // Fixed tool follows the vehicle exactly — no Torriem state.
+            toolHeading = p.Heading;
+            toolE = hitchE;
+            toolN = hitchN;
+        }
+        else
+        {
+            // Trailing / TBT — use the Torriem-tracked heading from the
+            // snapshot (stable across ticks) and project the tool back from
+            // the freshly-computed hitch along that heading.
+            toolHeading = _toolPositionService.ToolHeading;
+            double pivotOffset = tool.TrailingHitchLength - tool.TrailingToolToPivotLength;
+            toolE = hitchE - Math.Sin(toolHeading) * pivotOffset;
+            toolN = hitchN - Math.Cos(toolHeading) * pivotOffset;
+        }
+
+        // Lateral offset perpendicular to tool heading (right is positive,
+        // matching ToolPositionService.ApplyLateralOffset).
+        if (Math.Abs(tool.Offset) > 0.001)
+        {
+            double perp = toolHeading + Math.PI / 2.0;
+            toolE += Math.Sin(perp) * tool.Offset;
+            toolN += Math.Cos(perp) * tool.Offset;
+        }
+
+        _mapService.SetAllPositions(
+            p.Position.Easting, p.Position.Northing, p.Heading,
+            toolE, toolN, toolHeading,
+            ConfigStore.ActualToolWidth, hitchE, hitchN,
+            _toolPositionService.IsToolPositionReady);
+
+        if (sm)
+        {
+            _smCycleTicks += System.Diagnostics.Stopwatch.GetTimestamp() - smT0;
+            _smCycleAllocs += GC.GetAllocatedBytesForCurrentThread() - smA0;
+            _smCycleCount++;
+            var elapsed = (DateTime.UtcNow - _smWindowStart).TotalSeconds;
+            if (elapsed >= 1.0 && _smCycleCount > 0)
+            {
+                double ticksPerUs = System.Diagnostics.Stopwatch.Frequency / 1_000_000.0;
+                Console.WriteLine(
+                    $"[StateMirror-PERF] cycles={_smCycleCount}"
+                    + $" us/cycle={(_smCycleTicks / ticksPerUs / _smCycleCount):F1}"
+                    + $" alloc/cycle={(_smCycleAllocs / _smCycleCount)}B"
+                    + $" total_us={(long)(_smCycleTicks / ticksPerUs)}"
+                    + $" total_alloc={_smCycleAllocs}B"
+                    + $" window={elapsed:F2}s");
+                _smCycleTicks = 0;
+                _smCycleAllocs = 0;
+                _smCycleCount = 0;
+                _smWindowStart = DateTime.UtcNow;
+            }
+        }
+    }
+
+    // PERF-05 #2: state-mirror accumulators. Gated by DiagFlags.PerfStateMirror.
+    private long _smCycleTicks;
+    private long _smCycleAllocs;
+    private int _smCycleCount;
+    private DateTime _smWindowStart = DateTime.UtcNow;
+
     private void RestoreSettings()
     {
         var settings = _settingsService.Settings;
@@ -375,8 +705,9 @@ public partial class MainViewModel : ObservableObject
         // Restore vehicle profile settings
         LoadDefaultVehicleProfile();
 
-        // Load NTRIP profiles
-        _ = _ntripProfileService.LoadProfilesAsync();
+        // Load NTRIP profiles, then auto-connect the default caster at startup so
+        // GPS gets RTCM corrections immediately (no wait when opening a field).
+        _ = LoadProfilesThenAutoConnectAsync();
 
         // Restore legacy NTRIP settings (used if no profiles exist)
         NtripCasterAddress = settings.NtripCasterIp;
@@ -399,17 +730,28 @@ public partial class MainViewModel : ObservableObject
         // (setting _displaySettings directly doesn't trigger property change notification)
         OnPropertyChanged(nameof(IsGridOn));
 
-        // Restore simulator settings (always restore coords, regardless of enabled state)
+        // Restore last camera follow mode (Map / NorthUp / HeadingUp) — state.
+        if (PersistentState.CameraMode != CameraMode.Free)
+            CameraMode = PersistentState.CameraMode;
+
+        // Prime _last3DPitch from the saved CameraPitch so the 2D/3D toggle
+        // restores the user's prior tilt instead of the hard-coded -60° default.
+        // ConfigurationService loads CameraPitch directly into the backing
+        // field, bypassing the setter that would otherwise capture this.
+        if (_displaySettings.CameraPitch > -89.0)
+            _last3DPitch = _displaySettings.CameraPitch;
+
+        // Restore simulator position (state). Always restore coords regardless
+        // of enabled state so map dialogs work at startup.
         _simulatorService.Initialize(new AgValoniaGPS.Models.Wgs84(
-            settings.SimulatorLatitude,
-            settings.SimulatorLongitude));
-        _simulatorService.StepDistance = settings.SimulatorSpeed;
+            PersistentState.SimulatorLatitude,
+            PersistentState.SimulatorLongitude));
+        _simulatorService.StepDistance = PersistentState.SimulatorSpeed;
 
-        // Also set Latitude/Longitude so map dialogs work correctly at startup
-        Latitude = settings.SimulatorLatitude;
-        Longitude = settings.SimulatorLongitude;
+        Latitude = PersistentState.SimulatorLatitude;
+        Longitude = PersistentState.SimulatorLongitude;
 
-        _logger.LogDebug("Restored simulator: {Lat},{Lon}", settings.SimulatorLatitude, settings.SimulatorLongitude);
+        _logger.LogDebug("Restored simulator: {Lat},{Lon}", PersistentState.SimulatorLatitude, PersistentState.SimulatorLongitude);
 
         // Restore simulator enabled state and panel visibility.
         // hide_all_panels diagnostic flag suppresses the auto-open so baseline
@@ -424,12 +766,27 @@ public partial class MainViewModel : ObservableObject
             initialToolWidth += config.Tool.GetSectionWidth(i) / 100.0;
         if (initialToolWidth > 0.1)
             ToolWidth = initialToolWidth;
+
+        // Surface any crash-recovery that happened while loading settings or
+        // the active profile pair. Deferred to the dispatcher so the dialog
+        // host is ready (RestoreSettings runs during construction).
+        Avalonia.Threading.Dispatcher.UIThread.Post(
+            CheckStartupRecovery,
+            Avalonia.Threading.DispatcherPriority.Background);
     }
 
     private void LoadDefaultVehicleProfile()
     {
         try
         {
+            // One-time #346 migration: split any pre-v2 combined profiles
+            // into paired v2 vehicle + tool files before the load below
+            // tries to find them.
+            if (_configurationService.MigrateV1ProfilesIfNeeded())
+            {
+                _logger.LogInformation("Migrated v1 vehicle profiles to v2 (split vehicle/tool)");
+            }
+
             var profiles = _configurationService.GetAvailableProfiles();
             if (profiles.Count == 0)
             {
@@ -438,34 +795,51 @@ public partial class MainViewModel : ObservableObject
             }
 
             // Try to load the last used profile first
-            var lastUsedProfile = _settingsService.Settings.LastUsedVehicleProfile;
-            string profileToLoad;
+            var lastUsedVehicle = _settingsService.Settings.LastUsedVehicleProfile;
+            var lastUsedTool = _settingsService.Settings.LastUsedToolProfile;
+            string vehicleToLoad;
 
-            if (!string.IsNullOrEmpty(lastUsedProfile) && profiles.Contains(lastUsedProfile))
+            if (!string.IsNullOrEmpty(lastUsedVehicle) && profiles.Contains(lastUsedVehicle))
             {
-                profileToLoad = lastUsedProfile;
-                _logger.LogDebug("Loading last used vehicle profile: {ProfileName}", profileToLoad);
+                vehicleToLoad = lastUsedVehicle;
+                _logger.LogDebug("Loading last used vehicle profile: {ProfileName}", vehicleToLoad);
             }
             else
             {
                 // Fall back to first available profile
-                profileToLoad = profiles[0];
-                _logger.LogDebug("Loading first available vehicle profile: {ProfileName}", profileToLoad);
+                vehicleToLoad = profiles[0];
+                _logger.LogDebug("Loading first available vehicle profile: {ProfileName}", vehicleToLoad);
             }
 
-            // Use ConfigurationService to load - this sets ConfigurationStore.ActiveProfileName
-            if (_configurationService.LoadProfile(profileToLoad))
+            // If no tool was previously paired (fresh install / pre-#346
+            // settings file), fall back to a same-named tool — that's the
+            // post-migration default and matches what the picker will show
+            // until the operator picks a different combo.
+            var availableTools = _configurationService.GetAvailableToolProfiles();
+            string toolToLoad;
+            if (!string.IsNullOrEmpty(lastUsedTool) && availableTools.Contains(lastUsedTool))
+                toolToLoad = lastUsedTool;
+            else if (availableTools.Contains(vehicleToLoad))
+                toolToLoad = vehicleToLoad;
+            else if (availableTools.Count > 0)
+                toolToLoad = availableTools[0];
+            else
+                toolToLoad = vehicleToLoad; // best-effort; LoadProfiles tolerates a missing tool file
+
+            // LoadProfiles persists the chosen pair back to AppSettings, so
+            // a same-name fallback here will overwrite an empty
+            // LastUsedToolProfile with a real name on the next save.
+            if (_configurationService.LoadProfiles(vehicleToLoad, toolToLoad))
             {
                 var store = _configurationService.Store;
-                _logger.LogInformation("Loaded vehicle profile: {ProfileName}", store.ActiveProfileName);
+                _logger.LogInformation(
+                    "Loaded vehicle profile: {Vehicle} / tool: {Tool}",
+                    store.ActiveVehicleProfileName,
+                    store.ActiveToolProfileName);
                 _logger.LogDebug("  Tool width: {ToolWidth}m (from {NumSections} sections)", store.ActualToolWidth, store.NumSections);
                 _logger.LogDebug("  YouTurn radius: {Radius}m", store.Guidance.UTurnRadius);
                 _logger.LogDebug("  Wheelbase: {Wheelbase}m", store.Vehicle.Wheelbase);
                 _logger.LogDebug("  Sections: {NumSections}", store.NumSections);
-
-                // Save as last used profile
-                _settingsService.Settings.LastUsedVehicleProfile = profileToLoad;
-                _settingsService.Save();
             }
         }
         catch (Exception ex)
@@ -523,6 +897,9 @@ public partial class MainViewModel : ObservableObject
                 State.Connections.AutoSteerIpAddress = _udpService.GetModuleIpAddress(ModuleType.AutoSteer);
                 State.Connections.MachineIpAddress = _udpService.GetModuleIpAddress(ModuleType.Machine);
                 State.Connections.ImuIpAddress = _udpService.GetModuleIpAddress(ModuleType.IMU);
+                // GPS IP + subnet are only known after a PGN 203 scan reply.
+                State.Connections.GpsIpAddress = _udpService.GetModuleIpAddress(ModuleType.GPS);
+                State.Connections.ModuleSubnet = _udpService.GetModuleSubnet();
 
                 // Legacy property updates (for existing bindings - will be removed in Phase 5)
                 IsAutoSteerDataOk = steerOk;
@@ -666,13 +1043,21 @@ public partial class MainViewModel : ObservableObject
     public bool IsManualSectionMode
     {
         get => _isManualAllOn;
-        set => SetProperty(ref _isManualAllOn, value);
+        set
+        {
+            if (SetProperty(ref _isManualAllOn, value))
+                OnPropertyChanged(nameof(IsSectionBarVisible));
+        }
     }
 
     public bool IsSectionMasterOn
     {
         get => _isAutoAllOn;
-        set => SetProperty(ref _isAutoAllOn, value);
+        set
+        {
+            if (SetProperty(ref _isAutoAllOn, value))
+                OnPropertyChanged(nameof(IsSectionBarVisible));
+        }
     }
 
     public bool IsAutoSteerAvailable
@@ -688,7 +1073,11 @@ public partial class MainViewModel : ObservableObject
     public bool IsAutoSteerEngaged
     {
         get => _isAutoSteerEngaged;
-        set => SetProperty(ref _isAutoSteerEngaged, value);
+        set
+        {
+            if (SetProperty(ref _isAutoSteerEngaged, value))
+                OnPropertyChanged(nameof(IsManualUTurnVisible));
+        }
     }
 
     // IsYouTurnEnabled is now in MainViewModel.YouTurn.cs
@@ -930,6 +1319,50 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
+    /// <summary>Worked area minus overlap, formatted for the AgOpen-style stats card.</summary>
+    public string ActualAreaDisplay => FormatArea(_fieldStatistics.ActualAreaCovered);
+
+    /// <summary>Remaining boundary area = total minus worked, formatted.</summary>
+    public string RemainingAreaDisplay
+    {
+        get
+        {
+            double remaining = WorkableAreaSqM - _coverageMapService.TotalWorkedArea;
+            return FormatArea(Math.Max(0, remaining));
+        }
+    }
+
+    /// <summary>Percentage of the boundary that has been worked.</summary>
+    public double WorkedPercent
+    {
+        get
+        {
+            double workable = WorkableAreaSqM;
+            if (workable <= 0) return 0;
+            return Math.Clamp((_coverageMapService.TotalWorkedArea / workable) * 100.0, 0, 100);
+        }
+    }
+
+    /// <summary>Overlap percent from the field-statistics service.</summary>
+    public double OverlapPercent => _fieldStatistics.OverlapPercent;
+
+    /// <summary>
+    /// Hours remaining at the current work rate. Returns <c>∞</c> when the
+    /// instantaneous rate is zero (stopped) so the card mirrors AgOpen's
+    /// readout instead of showing a confusing 0.
+    /// </summary>
+    public string HoursRemainingDisplay
+    {
+        get
+        {
+            double rateSqMPerHour = Speed * 3600 * ToolWidth;
+            if (rateSqMPerHour <= 0) return "∞";
+            double remainingSqM = Math.Max(0, WorkableAreaSqM - _coverageMapService.TotalWorkedArea);
+            double hours = remainingSqM / rateSqMPerHour;
+            return $"{hours:F1}";
+        }
+    }
+
     // Helper method to format area with metric/imperial support
     private string FormatArea(double squareMeters)
     {
@@ -948,6 +1381,12 @@ public partial class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(WorkedAreaDisplay));
         OnPropertyChanged(nameof(RemainingPercent));
         OnPropertyChanged(nameof(WorkRateDisplay));
+        OnPropertyChanged(nameof(ActualAreaDisplay));
+        OnPropertyChanged(nameof(RemainingAreaDisplay));
+        OnPropertyChanged(nameof(WorkedPercent));
+        OnPropertyChanged(nameof(OverlapPercent));
+        OnPropertyChanged(nameof(HoursRemainingDisplay));
+        RaiseStatusStripChanged();
     }
 
     /// <summary>
@@ -978,6 +1417,53 @@ public partial class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(ActiveFieldName));
         OnPropertyChanged(nameof(ActiveFieldArea));
         OnPropertyChanged(nameof(HasActiveField));
+        RaiseStatusStripChanged();
+    }
+
+    // Pending intents consumed by the next OpenFieldAsync. Set by the
+    // OpenField*Async overloads below; cleared on consumption. See the
+    // JobService block inside OpenFieldAsync for why this exists
+    // (race with CloseFieldAsync's coverage save).
+    private (string FieldName, string WorkType, string Notes, string? TaskName)? _pendingNewJob;
+    private (string FieldName, string TaskName)? _pendingResumeJob;
+    private bool _pendingFieldOnly;
+
+    /// <summary>
+    /// Open a field and create a brand-new job inside it. Coverage from
+    /// the previous active job is correctly saved to that previous job's
+    /// folder before the new job is created.
+    /// </summary>
+    public Task OpenFieldStartingNewJobAsync(
+        string fieldPath, string fieldName, string workType, string notes, string? taskName = null)
+    {
+        _pendingNewJob = (fieldName, workType, notes, taskName);
+        _pendingResumeJob = null;
+        _pendingFieldOnly = false;
+        return OpenFieldAsync(fieldPath, fieldName);
+    }
+
+    /// <summary>
+    /// Open a field and resume an existing job inside it.
+    /// </summary>
+    public Task OpenFieldResumingJobAsync(string fieldPath, string fieldName, string taskName)
+    {
+        _pendingResumeJob = (fieldName, taskName);
+        _pendingNewJob = null;
+        _pendingFieldOnly = false;
+        return OpenFieldAsync(fieldPath, fieldName);
+    }
+
+    /// <summary>
+    /// Open a field's geometry without activating any job (Decision #2).
+    /// Coverage is not loaded; section paint is silently dropped at close
+    /// because <see cref="IJobService.ActiveJob"/> stays null.
+    /// </summary>
+    public Task OpenFieldOnlyAsync(string fieldPath, string fieldName)
+    {
+        _pendingFieldOnly = true;
+        _pendingNewJob = null;
+        _pendingResumeJob = null;
+        return OpenFieldAsync(fieldPath, fieldName);
     }
 
     /// <summary>
@@ -990,6 +1476,18 @@ public partial class MainViewModel : ObservableObject
 
         // Close current field first (saves coverage, clears state)
         await CloseFieldAsync();
+
+        // Wrap any pre-#349 coverage into a synthetic imported job. Idempotent;
+        // a no-op if the field already has a jobs/ folder.
+        try
+        {
+            if (LegacyFieldMigrationService.MigrateIfNeeded(fieldPath))
+                _logger.LogDebug("[Job] Migrated legacy coverage for '{FieldName}'", fieldName);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[Job] Legacy migration failed for '{FieldName}'", fieldName);
+        }
 
         // Show busy overlay for loading
         State.UI.BusyMessage = "Loading field...";
@@ -1006,6 +1504,7 @@ public partial class MainViewModel : ObservableObject
             CurrentFieldName = fieldName;
             IsFieldOpen = true;
             FieldsRootDirectory = Path.GetDirectoryName(fieldPath) ?? string.Empty;
+            _gpsPipelineService.SetHasActiveField(true);
 
             // Load field origin from Field.txt
             try
@@ -1066,6 +1565,11 @@ public partial class MainViewModel : ObservableObject
             var boundary = _boundaryFileService.LoadBoundary(fieldPath);
             if (boundary != null)
             {
+                // Migrate legacy/imported dense boundaries to normalized resolution
+                // in-memory so derived geometry (tram/headland), inside-tests, and
+                // rendering operate on a sane point count. Persisted on the next
+                // explicit boundary save. See Plans/BOUNDARY_RESOLUTION_NORMALIZATION.md.
+                NormalizeBoundaryInPlace(boundary);
                 SetCurrentBoundary(boundary);
                 CenterMapOnBoundary(boundary);
 
@@ -1105,31 +1609,91 @@ public partial class MainViewModel : ObservableObject
             // Load recorded path from RecPath.txt
             LoadRecPathFromField(fieldPath);
 
+            // Establish (or resume) the active job before any coverage paint
+            // is allowed. Coverage now lives under <field>/jobs/<task>/.
+            //
+            // The pending-intent fields below are set by the OpenField*Async
+            // overloads so the dialog can express "open field A and start
+            // job J2" without mutating JobService.ActiveJob before
+            // CloseFieldAsync runs — doing so used to misroute the previous
+            // job's in-memory coverage into the new job's folder.
+            Job? activeJob = null;
+            var newIntent = _pendingNewJob;
+            var resumeIntent = _pendingResumeJob;
+            var fieldOnly = _pendingFieldOnly;
+            _pendingNewJob = null;
+            _pendingResumeJob = null;
+            _pendingFieldOnly = false;
+
+            if (fieldOnly)
+            {
+                _logger.LogDebug("[Job] Field-only open; no job will be activated");
+            }
+            else if (newIntent != null)
+            {
+                activeJob = _jobService.CreateJob(
+                    newIntent.Value.FieldName,
+                    newIntent.Value.WorkType,
+                    newIntent.Value.Notes,
+                    newIntent.Value.TaskName);
+            }
+            else if (resumeIntent != null)
+            {
+                _jobService.ResumeJob(resumeIntent.Value.FieldName, resumeIntent.Value.TaskName);
+                activeJob = _jobService.ActiveJob!;
+            }
+            else
+            {
+                activeJob = _jobService.GetOrCreateDefaultJob(fieldName);
+            }
+            if (activeJob != null)
+            {
+                _logger.LogDebug("[Job] Active job: {TaskName} (status={Status})",
+                    activeJob.TaskName, activeJob.Status);
+            }
+
             // Load coverage (shows busy overlay — pixel buffer callback needs UI thread for bitmap access)
             State.UI.BusyMessage = "Loading coverage...";
             await Dispatcher.UIThread.InvokeAsync(() => { }, DispatcherPriority.Render);
 
-            _coverageMapService.LoadFromFile(fieldPath);
-            _logger.LogDebug($"[Coverage] Loaded coverage from {fieldPath}");
+            if (activeJob != null)
+            {
+                _coverageMapService.LoadFromFile(fieldPath, activeJob.TaskName);
+                _logger.LogDebug($"[Coverage] Loaded coverage from {fieldPath} job={activeJob.TaskName}");
+            }
+            else
+            {
+                // Field-only opens skip coverage load — but they still need to
+                // fire CoverageUpdated(IsFullReload=true) so the map control's
+                // handler runs ClearCoveragePixels + MarkCoverageFullRebuildNeeded
+                // during the busy overlay. Resume Job gets this for free via
+                // LoadFromFile; without parity here, the coverage-bitmap
+                // rebuild gets deferred until the first non-stationary GPS
+                // cycle and lands on the UI thread as a 2-3 s freeze.
+                _coverageMapService.ClearAll();
+            }
             RefreshCoverageStatistics();
 
-            // Load tram lines
-            try
-            {
-                _tramLineService.LoadFromFile(fieldPath);
-                if (_tramLineService.HasTramLines)
-                {
-                    _mapService.SetTramLines(
-                        _tramLineService.OuterBoundaryTrack,
-                        _tramLineService.InnerBoundaryTrack,
-                        _tramLineService.ParallelTramLines);
-                    _logger.LogDebug($"[Tram] Loaded tram lines from {fieldPath}");
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to load tram lines");
-            }
+            // Start periodic coverage autosave. The timer no-ops on each
+            // tick when ActiveJob is null (field-only open), so it's safe
+            // to start unconditionally here.
+            StartCoverageAutosave();
+
+            // Tram lines are computed on demand (when the user presses Build/Toggle
+            // tram), not eagerly on field open: they are rarely used and parsing a
+            // large saved TramLines.txt was costing seconds on the open critical path.
+            // The tram buttons regenerate via UpdateTramLines from the current track/
+            // systems, so the on-disk file is only a persistence cache. Start clean so
+            // a prior field's lines don't linger. See
+            // Plans/BOUNDARY_RESOLUTION_NORMALIZATION.md.
+            _tramLineService.Clear();
+            _mapService.SetTramLines(
+                _tramLineService.OuterBoundaryTrack,
+                _tramLineService.InnerBoundaryTrack,
+                _tramLineService.ParallelTramLines);
+
+            // Load field-scoped tram scalar settings (resets to defaults if absent).
+            Services.Tram.TramConfigFileService.Load(fieldPath, ConfigStore.Tram);
 
             // Load tram systems
             try
@@ -1153,9 +1717,9 @@ public partial class MainViewModel : ObservableObject
             // Sync elevation log enabled state from config
             _elevationLogService.IsEnabled = Models.Configuration.ConfigurationStore.Instance.Display.ElevationLogEnabled;
 
-            // Save as last opened field
-            _settingsService.Settings.LastOpenedField = fieldName;
-            _settingsService.Save();
+            // Save as last opened field (persistent state → appstate.json)
+            PersistentState.LastOpenedField = fieldName;
+            _persistentStateService.Save();
 
             // Force simulator ticks so vehicle position updates to field origin
             if (IsSimulatorEnabled)
@@ -1191,6 +1755,12 @@ public partial class MainViewModel : ObservableObject
     /// </summary>
     public async Task CloseFieldAsync()
     {
+        // Stop the autosave timer first so a tick can't fire mid-close
+        // and race the explicit close-save below. ClearFieldState also
+        // stops it, but stopping here covers both branches without
+        // depending on call order.
+        StopCoverageAutosave();
+
         if (ActiveField == null || string.IsNullOrEmpty(ActiveField.DirectoryPath))
         {
             // No field to close, just clear state
@@ -1211,10 +1781,21 @@ public partial class MainViewModel : ObservableObject
             await Dispatcher.UIThread.InvokeAsync(() => { }, DispatcherPriority.Render);
             await Task.Delay(50);
 
-            // Save coverage on background thread (RLE compression can take seconds)
+            // Save coverage on background thread (RLE compression can take seconds).
+            // Coverage is keyed by the active job's task name; if no job is
+            // active (field-only open) the save is skipped.
             var savePath = ActiveField.DirectoryPath;
-            await Task.Run(() => _coverageMapService.SaveToFile(savePath));
-            _logger.LogDebug($"[Coverage] Saved coverage to {savePath}");
+            var activeJob = _jobService.ActiveJob;
+            if (activeJob != null)
+            {
+                var taskName = activeJob.TaskName;
+                await Task.Run(() => _coverageMapService.SaveToFile(savePath, taskName));
+                _logger.LogDebug($"[Coverage] Saved coverage to {savePath} job={taskName}");
+            }
+            else
+            {
+                _logger.LogDebug("[Coverage] No active job; skipping coverage save (field-only open)");
+            }
 
             // Save tram lines
             if (_tramLineService.HasTramLines)
@@ -1230,6 +1811,9 @@ public partial class MainViewModel : ObservableObject
                 _logger.LogDebug($"[Tram] Saved {ConfigStore.Tram.Systems.Count} tram systems");
             }
 
+            // Save field-scoped tram scalar settings.
+            Services.Tram.TramConfigFileService.Save(ActiveField.DirectoryPath, ConfigStore.Tram);
+
             // Flush elevation log
             _elevationLogService.Flush(ActiveField.DirectoryPath);
             _elevationLogService.Clear();
@@ -1239,6 +1823,12 @@ public partial class MainViewModel : ObservableObject
 
             // Save field (writes geojson + legacy formats)
             _fieldService.SaveField(ActiveField);
+
+            // Suspend rather than close. M2 has no explicit "Close Job"
+            // operator action — closing a field should leave the job
+            // in-progress so the next open of the same field resumes it.
+            // The dialog UI in M3+ will surface explicit close/done.
+            _jobService.SuspendCurrentJob();
         }
         catch (Exception ex)
         {
@@ -1259,6 +1849,10 @@ public partial class MainViewModel : ObservableObject
     /// </summary>
     private void ClearFieldState()
     {
+        // Stop autosave (idempotent if already stopped). Belt-and-braces
+        // for callers that bypass CloseFieldAsync.
+        StopCoverageAutosave();
+
         // Disengage autosteer first so the cycle stops emitting steer commands
         // before the track / boundary / U-turn state vanishes out from under it.
         // Without this the tractor keeps executing the last-sent steer angle
@@ -1266,11 +1860,13 @@ public partial class MainViewModel : ObservableObject
         if (IsAutoSteerEngaged)
         {
             IsAutoSteerEngaged = false;
+            _autoSteerService.Disengage();
             SyncGuidanceStateToPipeline();
         }
 
         CurrentFieldName = string.Empty;
         IsFieldOpen = false;
+        _gpsPipelineService.SetHasActiveField(false);
 
         // Clear boundary
         SetCurrentBoundary(null);
@@ -1303,14 +1899,24 @@ public partial class MainViewModel : ObservableObject
     {
         if (field == null || string.IsNullOrEmpty(field.DirectoryPath))
         {
-            // Clear headland if no field - update centralized state
+            // Clear headland if no field - update centralized state.
+            // All in-memory headland state must be wiped here, otherwise it
+            // leaks across field-switch boundaries (e.g. close field A,
+            // create field B → field A's headland reappears on B because
+            // segments / preview were never cleared).
             State.Field.HeadlandLine = null;
             State.Field.HeadlandDistance = 0;
 
             _currentHeadlandLine = null;
             _mapService.SetHeadlandLine(null);
+            _mapService.SetHeadlandVisible(false);
+            HeadlandSegments.Clear();
+            HeadlandPreviewLine = null; // setter pushes null to map service
+
             HasHeadland = false;
             IsHeadlandOn = false;
+            OnPropertyChanged(nameof(CurrentHeadlandLine));
+            OnPropertyChanged(nameof(CurrentHeadlandLineForPreview));
             return;
         }
 
@@ -1608,6 +2214,15 @@ public partial class MainViewModel : ObservableObject
                 HasActiveTrack = value != null;
                 IsAutoSteerAvailable = value != null;
 
+                // No U-turns on a closed/polygon track — turn the toggle off and
+                // refresh the dependent UI (button visibility) (#421).
+                if (IsActiveTrackClosed && IsYouTurnEnabled)
+                    IsYouTurnEnabled = false;
+                OnPropertyChanged(nameof(IsActiveTrackClosed));
+                OnPropertyChanged(nameof(IsManualUTurnVisible));
+                RaiseUTurnButtonVisibleChanged();
+                RaiseStatusStripChanged();
+
                 // Sync to pipeline so guidance computes on background thread
                 SyncGuidanceStateToPipeline();
 
@@ -1685,14 +2300,13 @@ public partial class MainViewModel : ObservableObject
                 _tramSystemLineRanges[sys.Name] = (startIdx, lines.Count, false);
             }
         }
-        else if (!_hasTramSystemsEverUsed && track != null && track.Points.Count >= 2)
+        else if (!_hasTramSystemsEverUsed)
         {
-            // Legacy: single track mode (only if systems have never been used in this field)
-            _tramLineService.GenerateParallelTramLines(track, fieldWidth);
-
-            // Legacy: also generate boundary tram tracks from headland
-            if (_currentHeadlandLine != null && _currentHeadlandLine.Count >= 3)
-                _tramLineService.GenerateBoundaryTramTracks(_currentHeadlandLine);
+            // Controlled-traffic lanes parallel to the field boundary, spaced at the
+            // tram (sprayer/CTF) width. Clean concentric Clipper offsets — replaces the
+            // legacy per-point lateral offset of the guidance curve, which folded into a
+            // self-intersecting "web" on irregular/curved fields.
+            _tramLineService.GenerateConcentricTramLanes();
         }
 
         // Snapshot collections for thread-safe rendering
@@ -1771,9 +2385,19 @@ public partial class MainViewModel : ObservableObject
     /// </summary>
     public ObservableCollection<FieldAssociationItem> AvailableFieldsForProfile { get; } = new();
 
+    // Shared chain navigation (Back / Close) for every fly-out → dialog chain.
+    // See MainViewModel.Navigation.Chain.cs.
+    public ICommand? NavBackCommand { get; private set; }
+    public ICommand? NavCloseChainCommand { get; private set; }
+
+    // Back from a Field Tools tool overlay to the Field Tools fly-out.
+    public ICommand? BackToFieldToolsCommand { get; private set; }
+
+    // Back from a fly-out-launched confirmation to its originating fly-out.
+    public ICommand? BackFromConfirmationCommand { get; private set; }
+
     // NTRIP Profiles commands
     public ICommand? ShowNtripProfilesDialogCommand { get; private set; }
-    public ICommand? CloseNtripProfilesDialogCommand { get; private set; }
     public ICommand? AddNtripProfileCommand { get; private set; }
     public ICommand? EditNtripProfileCommand { get; private set; }
     public ICommand? DeleteNtripProfileCommand { get; private set; }
@@ -1783,8 +2407,8 @@ public partial class MainViewModel : ObservableObject
     public ICommand? TestNtripConnectionCommand { get; private set; }
 
     // Settings Commands
-    public ICommand? ShowAppDirectoriesDialogCommand { get; private set; }
-    public ICommand? CloseAppDirectoriesDialogCommand { get; private set; }
+    public ICommand? ShowAppSettingsDialogCommand { get; private set; }
+    public ICommand? CloseAppSettingsDialogCommand { get; private set; }
     public ICommand? ShowAboutDialogCommand { get; private set; }
     public ICommand? CloseAboutDialogCommand { get; private set; }
     public ICommand? ResetAllSettingsCommand { get; private set; }
@@ -2109,8 +2733,63 @@ public partial class MainViewModel : ObservableObject
         set => SetProperty(ref _confirmationDialogMessage, value);
     }
 
-    // Callback to run when confirmation dialog is confirmed
+    // Optional checkbox shown above the buttons. Hidden when label is null/empty.
+    private string? _confirmationDialogCheckboxLabel;
+    public string? ConfirmationDialogCheckboxLabel
+    {
+        get => _confirmationDialogCheckboxLabel;
+        set
+        {
+            if (SetProperty(ref _confirmationDialogCheckboxLabel, value))
+                OnPropertyChanged(nameof(IsConfirmationDialogCheckboxVisible));
+        }
+    }
+
+    public bool IsConfirmationDialogCheckboxVisible =>
+        !string.IsNullOrEmpty(_confirmationDialogCheckboxLabel);
+
+    private bool _confirmationDialogCheckboxChecked;
+    public bool ConfirmationDialogCheckboxChecked
+    {
+        get => _confirmationDialogCheckboxChecked;
+        set => SetProperty(ref _confirmationDialogCheckboxChecked, value);
+    }
+
+    // Optional explicit button labels. When both are set, the dialog shows
+    // buttons captioned with the actual choices (e.g. "Use Restored" /
+    // "New From Defaults") instead of the generic localized Yes/No, so a
+    // two-action prompt is unambiguous. Null/empty falls back to Yes/No.
+    private string? _confirmationDialogConfirmLabel;
+    public string? ConfirmationDialogConfirmLabel
+    {
+        get => _confirmationDialogConfirmLabel;
+        set
+        {
+            if (SetProperty(ref _confirmationDialogConfirmLabel, value))
+                OnPropertyChanged(nameof(HasCustomConfirmationButtons));
+        }
+    }
+
+    private string? _confirmationDialogCancelLabel;
+    public string? ConfirmationDialogCancelLabel
+    {
+        get => _confirmationDialogCancelLabel;
+        set
+        {
+            if (SetProperty(ref _confirmationDialogCancelLabel, value))
+                OnPropertyChanged(nameof(HasCustomConfirmationButtons));
+        }
+    }
+
+    public bool HasCustomConfirmationButtons =>
+        !string.IsNullOrEmpty(_confirmationDialogConfirmLabel) &&
+        !string.IsNullOrEmpty(_confirmationDialogCancelLabel);
+
+    // Callbacks. Only one is set per ShowConfirmationDialog call. The
+    // checkbox variant receives the checkbox state at the time the user
+    // clicked Confirm.
     private Action? _confirmationDialogCallback;
+    private Action<bool>? _confirmationDialogCheckboxCallback;
     private Models.State.DialogType _previousDialogBeforeConfirmation;
 
     public ICommand? CancelConfirmationDialogCommand { get; private set; }
@@ -2125,7 +2804,62 @@ public partial class MainViewModel : ObservableObject
     {
         ConfirmationDialogTitle = title;
         ConfirmationDialogMessage = message;
+        ConfirmationDialogCheckboxLabel = null;
+        ConfirmationDialogCheckboxChecked = false;
+        ConfirmationDialogConfirmLabel = null;
+        ConfirmationDialogCancelLabel = null;
         _confirmationDialogCallback = onConfirm;
+        _confirmationDialogCheckboxCallback = null;
+        _previousDialogBeforeConfirmation = State.UI.ActiveDialog;
+        State.UI.ShowDialog(Models.State.DialogType.Confirmation);
+    }
+
+    /// <summary>
+    /// Confirmation dialog whose buttons are captioned with the actual choices
+    /// (e.g. "Use Restored" / "New From Defaults") so a two-action decision is
+    /// unambiguous. <paramref name="confirmLabel"/> is the affirmative
+    /// (right-hand) button; <paramref name="cancelLabel"/> is the dismiss
+    /// (left-hand) button and also what a backdrop click selects.
+    /// </summary>
+    public void ShowConfirmationDialog(
+        string title,
+        string message,
+        string confirmLabel,
+        string cancelLabel,
+        Action onConfirm)
+    {
+        ConfirmationDialogTitle = title;
+        ConfirmationDialogMessage = message;
+        ConfirmationDialogCheckboxLabel = null;
+        ConfirmationDialogCheckboxChecked = false;
+        ConfirmationDialogConfirmLabel = confirmLabel;
+        ConfirmationDialogCancelLabel = cancelLabel;
+        _confirmationDialogCallback = onConfirm;
+        _confirmationDialogCheckboxCallback = null;
+        _previousDialogBeforeConfirmation = State.UI.ActiveDialog;
+        State.UI.ShowDialog(Models.State.DialogType.Confirmation);
+    }
+
+    /// <summary>
+    /// Confirmation dialog with an extra checkbox above the buttons.
+    /// The callback receives the checkbox state at confirm time so the
+    /// caller can branch on it (e.g. "also delete N jobs").
+    /// </summary>
+    public void ShowConfirmationDialog(
+        string title,
+        string message,
+        string checkboxLabel,
+        bool defaultChecked,
+        Action<bool> onConfirm)
+    {
+        ConfirmationDialogTitle = title;
+        ConfirmationDialogMessage = message;
+        ConfirmationDialogCheckboxLabel = checkboxLabel;
+        ConfirmationDialogCheckboxChecked = defaultChecked;
+        ConfirmationDialogConfirmLabel = null;
+        ConfirmationDialogCancelLabel = null;
+        _confirmationDialogCallback = null;
+        _confirmationDialogCheckboxCallback = onConfirm;
         _previousDialogBeforeConfirmation = State.UI.ActiveDialog;
         State.UI.ShowDialog(Models.State.DialogType.Confirmation);
     }
@@ -2307,47 +3041,52 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
-    private bool _isDrawRightSide = true;
+    // Boundary-recording setup is persistent STATE (last-used setup, restored
+    // for continuity). These VM properties delegate to PersistentAppState and
+    // raise change notifications for the bound UI.
     public bool IsDrawRightSide
     {
-        get => _isDrawRightSide;
+        get => PersistentState.BoundaryDrawRightSide;
         set
         {
-            SetProperty(ref _isDrawRightSide, value);
+            if (PersistentState.BoundaryDrawRightSide == value) return;
+            PersistentState.BoundaryDrawRightSide = value;
+            OnPropertyChanged();
             StatusMessage = value ? "Boundary on right side" : "Boundary on left side";
             UpdateBoundaryOffsetIndicator();
         }
     }
 
-    private bool _isDrawAtPivot;
     public bool IsDrawAtPivot
     {
-        get => _isDrawAtPivot;
+        get => PersistentState.BoundaryDrawAtPivot;
         set
         {
-            SetProperty(ref _isDrawAtPivot, value);
+            if (PersistentState.BoundaryDrawAtPivot == value) return;
+            PersistentState.BoundaryDrawAtPivot = value;
+            OnPropertyChanged();
             StatusMessage = value ? "Recording at pivot point" : "Recording at tool";
         }
     }
 
-    private double _boundaryOffset;
     public double BoundaryOffset
     {
-        get => _boundaryOffset;
+        get => PersistentState.BoundaryOffset;
         set
         {
-            var oldValue = _boundaryOffset;
-            SetProperty(ref _boundaryOffset, value);
-            if (Math.Abs(oldValue - value) > 0.0001)
-                UpdateBoundaryOffsetIndicator();
+            var oldValue = PersistentState.BoundaryOffset;
+            if (Math.Abs(oldValue - value) < 0.0001) return;
+            PersistentState.BoundaryOffset = value;
+            OnPropertyChanged();
+            UpdateBoundaryOffsetIndicator();
         }
     }
 
     private void UpdateBoundaryOffsetIndicator()
     {
         // Apply direction: right side = positive offset, left side = negative offset
-        double signedOffsetMeters = _boundaryOffset / 100.0;
-        if (!_isDrawRightSide)
+        double signedOffsetMeters = PersistentState.BoundaryOffset / 100.0;
+        if (!PersistentState.BoundaryDrawRightSide)
         {
             signedOffsetMeters = -signedOffsetMeters;
         }
@@ -2360,14 +3099,14 @@ public partial class MainViewModel : ObservableObject
     /// </summary>
     private (double easting, double northing) CalculateOffsetPosition(double easting, double northing, double headingRadians)
     {
-        if (_boundaryOffset == 0)
+        if (PersistentState.BoundaryOffset == 0)
             return (easting, northing);
 
         // Offset in meters (input is cm)
-        double offsetMeters = _boundaryOffset / 100.0;
+        double offsetMeters = PersistentState.BoundaryOffset / 100.0;
 
         // If drawing on left side, negate the offset
-        if (!_isDrawRightSide)
+        if (!PersistentState.BoundaryDrawRightSide)
             offsetMeters = -offsetMeters;
 
         // Calculate perpendicular offset (90 degrees to the right of heading)
@@ -2404,39 +3143,74 @@ public partial class MainViewModel : ObservableObject
         set => SetProperty(ref _smartWasViewModel, value);
     }
 
-    public ICommand? ShowConfigurationDialogCommand { get; private set; }
-    public ICommand? CancelConfigurationDialogCommand { get; private set; }
+    // Load Vehicle/Tool picker dialog (#346)
+    private LoadVehicleToolDialogViewModel? _loadVehicleToolDialogVm;
+    public LoadVehicleToolDialogViewModel? LoadVehicleToolDialogVm
+    {
+        get => _loadVehicleToolDialogVm;
+        set => SetProperty(ref _loadVehicleToolDialogVm, value);
+    }
+
+    // Start Work Session dialog (#349 M3)
+    private StartWorkSessionDialogViewModel? _startWorkSessionDialogVm;
+    public StartWorkSessionDialogViewModel? StartWorkSessionDialogVm
+    {
+        get => _startWorkSessionDialogVm;
+        set => SetProperty(ref _startWorkSessionDialogVm, value);
+    }
+
+    // Resume Job cross-field history dialog (#349 M4)
+    private ResumeJobDialogViewModel? _resumeJobDialogVm;
+    public ResumeJobDialogViewModel? ResumeJobDialogVm
+    {
+        get => _resumeJobDialogVm;
+        set => SetProperty(ref _resumeJobDialogVm, value);
+    }
+
+    public ICommand? ShowVehicleConfigDialogCommand { get; private set; }
+    public ICommand? ShowToolConfigDialogCommand { get; private set; }
+    public ICommand? ShowLoadVehicleToolDialogCommand { get; private set; }
+    public ICommand? CancelLoadVehicleToolDialogCommand { get; private set; }
+    public ICommand? ShowStartWorkSessionDialogCommand { get; private set; }
+    public ICommand? CancelStartWorkSessionDialogCommand { get; private set; }
+    public ICommand? ShowResumeJobDialogCommand { get; private set; }
+    public ICommand? CancelResumeJobDialogCommand { get; private set; }
+    public ICommand? ResumeLastJobCommand { get; private set; }
     public ICommand? ShowAutoSteerConfigCommand { get; private set; }
     public ICommand? ShowSmartWasCommand { get; private set; }
     public ICommand? CloseSmartWasDialogCommand { get; private set; }
-    public ICommand? ShowLoadProfileDialogCommand { get; private set; }
-    public ICommand? ShowNewProfileDialogCommand { get; private set; }
-    public ICommand? LoadSelectedProfileCommand { get; private set; }
-    public ICommand? CancelProfileSelectionCommand { get; private set; }
 
-    // Profile selection dialog
-    private bool _isProfileSelectionVisible;
-    public bool IsProfileSelectionVisible
+    public string CurrentProfileName => _configurationService.Store.ActiveVehicleProfileName;
+    public string CurrentToolProfileName => _configurationService.Store.ActiveToolProfileName;
+
+    /// <summary>
+    /// Combined "Vehicle / Tool" label for the configuration-panel pill so
+    /// the operator sees both halves of the active pair at a glance.
+    /// </summary>
+    public string CurrentProfileSummary
     {
-        get => _isProfileSelectionVisible;
-        set => SetProperty(ref _isProfileSelectionVisible, value);
+        get
+        {
+            var v = _configurationService.Store.ActiveVehicleProfileName;
+            var t = _configurationService.Store.ActiveToolProfileName;
+            if (string.IsNullOrEmpty(t)) return v;
+            return $"{v} / {t}";
+        }
     }
 
-    private System.Collections.ObjectModel.ObservableCollection<string> _availableProfiles = new();
-    public System.Collections.ObjectModel.ObservableCollection<string> AvailableProfiles
+    /// <summary>
+    /// Notifies bindings tied to the active vehicle/tool profile names.
+    /// Wired to <see cref="IConfigurationService.ProfileLoaded"/> /
+    /// <see cref="IConfigurationService.ProfileSaved"/> so labels like the
+    /// status pill on ConfigurationPanel refresh after the picker dialog
+    /// or any other profile change.
+    /// </summary>
+    private void RaiseProfileNameChanged()
     {
-        get => _availableProfiles;
-        set => SetProperty(ref _availableProfiles, value);
+        OnPropertyChanged(nameof(CurrentProfileName));
+        OnPropertyChanged(nameof(CurrentToolProfileName));
+        OnPropertyChanged(nameof(CurrentProfileSummary));
     }
-
-    private string? _selectedProfile;
-    public string? SelectedProfile
-    {
-        get => _selectedProfile;
-        set => SetProperty(ref _selectedProfile, value);
-    }
-
-    public string CurrentProfileName => _configurationService.Store.ActiveProfileName;
 
     // Headland Builder properties (visibility managed by State.UI)
     private bool _isHeadlandOn;
@@ -2795,23 +3569,58 @@ public partial class MainViewModel : ObservableObject
     public bool IsFieldOpen
     {
         get => _isFieldOpen;
-        set => SetProperty(ref _isFieldOpen, value);
+        set
+        {
+            if (SetProperty(ref _isFieldOpen, value))
+            {
+                // Commands gated on having a field open need to refresh
+                // CanExecute when the field is opened or closed.
+                DeleteAppliedAreaCommand?.NotifyCanExecuteChanged();
+                OnPropertyChanged(nameof(IsSectionBarVisible));
+            }
+        }
     }
 
     private string _currentFieldName = string.Empty;
     public string CurrentFieldName
     {
         get => _currentFieldName;
-        set => SetProperty(ref _currentFieldName, value);
+        set
+        {
+            if (SetProperty(ref _currentFieldName, value))
+                OnPropertyChanged(nameof(CurrentFieldAndJobLabel));
+        }
+    }
+
+    /// <summary>
+    /// Active job's task name, or empty when no job is active.
+    /// </summary>
+    public string CurrentJobTaskName => _jobService?.ActiveJob?.TaskName ?? string.Empty;
+
+    /// <summary>
+    /// Combined "field / task" label for the JobMenu pill and the
+    /// upper-right status strip. Returns just the field name when there's
+    /// no active job (e.g. field-only opens once that path lands).
+    /// </summary>
+    public string CurrentFieldAndJobLabel
+    {
+        get
+        {
+            var fieldName = CurrentFieldName;
+            var task = CurrentJobTaskName;
+            if (string.IsNullOrEmpty(fieldName)) return string.Empty;
+            return string.IsNullOrEmpty(task) ? fieldName : $"{fieldName} / {task}";
+        }
     }
 
     // Commands
-    public ICommand? ToggleViewSettingsPanelCommand { get; private set; }
+    public ICommand? ToggleScreenAlertsPanelCommand { get; private set; }
     public ICommand? ToggleFileMenuPanelCommand { get; private set; }
     public ICommand? ToggleToolsPanelCommand { get; private set; }
-    public ICommand? ToggleConfigurationPanelCommand { get; private set; }
-    public ICommand? ToggleJobMenuPanelCommand { get; private set; }
+    public ICommand? ToggleFieldOperationsPanelCommand { get; private set; }
     public ICommand? ToggleFieldToolsPanelCommand { get; private set; }
+    public ICommand? ToggleNetworkIoPanelCommand { get; private set; }
+    public ICommand? CloseAllNavFlyoutsCommand { get; private set; }
     public ICommand? ToggleAutoTrackCommand { get; private set; }
     public ICommand? ToggleGridCommand { get; private set; }
     public ICommand? ToggleDayNightCommand { get; private set; }
@@ -2820,8 +3629,6 @@ public partial class MainViewModel : ObservableObject
     public ICommand? ToggleCameraModeCommand { get; private set; }
     public ICommand? IncreaseCameraPitchCommand { get; private set; }
     public ICommand? DecreaseCameraPitchCommand { get; private set; }
-    public ICommand? IncreaseBrightnessCommand { get; private set; }
-    public ICommand? DecreaseBrightnessCommand { get; private set; }
     public ICommand? CycleDisplayResolutionCommand { get; private set; }
 
     // iOS Sheet Toggle Commands
@@ -2839,6 +3646,8 @@ public partial class MainViewModel : ObservableObject
     public ICommand? SimulatorReverseDirectionCommand { get; private set; }
     public ICommand? SimulatorSteerLeftCommand { get; private set; }
     public ICommand? SimulatorSteerRightCommand { get; private set; }
+    public ICommand? SimulatorSpeedDownCommand { get; private set; }
+    public ICommand? SimulatorSpeedUpCommand { get; private set; }
 
     // Dialog Commands
     public ICommand? ShowSimCoordsDialogCommand { get; private set; }
@@ -2988,7 +3797,8 @@ public partial class MainViewModel : ObservableObject
     // Right Navigation Panel Commands
     public ICommand? ToggleContourModeCommand { get; private set; }
     public ICommand? DeleteContoursCommand { get; private set; }
-    public ICommand? DeleteAppliedAreaCommand { get; private set; }
+    // IRelayCommand (not ICommand) so the IsFieldOpen setter can re-evaluate CanExecute.
+    public IRelayCommand? DeleteAppliedAreaCommand { get; private set; }
     public ICommand? ToggleTramDisplayCommand { get; private set; }
     public ICommand? BuildTramLinesCommand { get; private set; }
     public ICommand? CreateTrackFromBoundaryCommand { get; private set; }
@@ -3110,6 +3920,7 @@ public partial class MainViewModel : ObservableObject
     public ICommand? ToggleYouTurnCommand { get; private set; }
     public ICommand? ManualYouTurnLeftCommand { get; private set; }
     public ICommand? ManualYouTurnRightCommand { get; private set; }
+    public ICommand? ToggleUTurnDirectionCommand { get; private set; }
     public ICommand? ToggleAutoSteerCommand { get; private set; }
 
     // Chart Commands
@@ -3339,8 +4150,64 @@ public partial class MainViewModel : ObservableObject
             _boundaryFileService.SaveBoundary(boundary, fieldPath);
             RefreshBoundaryList();
             SetCurrentBoundary(boundary);
-            StatusMessage = "Boundary deleted";
+
+            // If that was the last boundary, drop the field-background image
+            // too — BackPic is georeferenced against the boundary, so leaving
+            // it on disk would float in space the next time the field opens.
+            bool hasOuter = boundary.OuterBoundary != null && boundary.OuterBoundary.IsValid;
+            bool hasInner = boundary.InnerBoundaries.Any(b => b.IsValid);
+            if (!hasOuter && !hasInner)
+            {
+                DeleteBackgroundImage(fieldPath);
+                StatusMessage = "Boundary deleted; background image removed";
+            }
+            else
+            {
+                StatusMessage = "Boundary deleted";
+            }
         }
+    }
+
+    private void DeleteBackgroundImage(string fieldPath)
+    {
+        try
+        {
+            var backPicPath = Path.Combine(fieldPath, "BackPic.png");
+            var backPicGeoPath = Path.Combine(fieldPath, "BackPic.txt");
+            if (File.Exists(backPicPath)) File.Delete(backPicPath);
+            if (File.Exists(backPicGeoPath)) File.Delete(backPicGeoPath);
+            _mapService.ClearBackground();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug($"[DeleteBackgroundImage] {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Normalize a loaded boundary's outer and inner polygons to a
+    /// resolution-independent point set (Douglas-Peucker + max-gap densify). Dense
+    /// GPS-captured or imported boundaries (e.g. ~3431 points at ~1 m for a 440-acre
+    /// field) otherwise propagate that density into tram/headland generation,
+    /// inside-tests, and rendering. Idempotent: an already-sparse boundary is left
+    /// essentially unchanged. See Plans/BOUNDARY_RESOLUTION_NORMALIZATION.md.
+    /// </summary>
+    private void NormalizeBoundaryInPlace(Boundary boundary)
+    {
+        void NormalizePolygon(BoundaryPolygon? poly)
+        {
+            if (poly?.Points == null || poly.Points.Count < 4) return;
+            int before = poly.Points.Count;
+            poly.Points = Models.Base.BoundaryResolution.Normalize(poly.Points);
+            poly.UpdateBounds();
+            if (poly.Points.Count != before)
+                _logger.LogDebug("[Boundary] Normalized polygon {Before} -> {After} points", before, poly.Points.Count);
+        }
+
+        NormalizePolygon(boundary.OuterBoundary);
+        if (boundary.InnerBoundaries != null)
+            foreach (var inner in boundary.InnerBoundaries)
+                NormalizePolygon(inner);
     }
 
     /// <summary>
@@ -3351,6 +4218,14 @@ public partial class MainViewModel : ObservableObject
     {
         _mapService.SetBoundary(boundary);
         CurrentBoundary = boundary;
+
+        // Keep the in-memory Field model's boundary in sync. Without this,
+        // ActiveField.Boundary remains whatever LoadField returned at open
+        // time (usually the empty placeholder for a freshly-created field),
+        // and CloseFieldAsync → FieldService.SaveField → SaveBoundary
+        // overwrites the user's drawing on disk with "$Boundary\n".
+        if (ActiveField != null)
+            ActiveField.Boundary = boundary;
 
         // Set HasBoundary based on whether we have a valid outer boundary
         HasBoundary = boundary?.OuterBoundary != null && boundary.OuterBoundary.IsValid;
@@ -4820,6 +5695,29 @@ public partial class MainViewModel : ObservableObject
     /// Load tracks from field directory.
     /// Supports WinForms TrackLines.txt format (primary) and legacy ABLines.txt format (fallback).
     /// </summary>
+    /// <summary>
+    /// Migrate a loaded curve track to the resolution-independent guidance
+    /// conventions: recompute per-point headings (atan2(dEast,dNorth)) and flag
+    /// closed loops. Tracks saved before #422's fix carried boundary-convention or
+    /// zero headings and IsClosed=false, which made the "which way is forward"
+    /// decision random (spin/reverse). Idempotent for correctly-built tracks.
+    /// </summary>
+    private static void MigrateCurveTrack(Track track)
+    {
+        if (track == null || !track.IsCurve || track.Points.Count < 3)
+            return;
+
+        // Closed loop if the first and last points coincide.
+        var first = track.Points[0];
+        var last = track.Points[^1];
+        double de = first.Easting - last.Easting;
+        double dn = first.Northing - last.Northing;
+        if (de * de + dn * dn < 1.0)
+            track.IsClosed = true;
+
+        track.Points = Models.Guidance.CurveProcessing.CalculateHeadings(track.Points);
+    }
+
     private void LoadTracksFromField(Field? field)
     {
         // Clear existing tracks from both state and legacy collection
@@ -4845,6 +5743,7 @@ public partial class MainViewModel : ObservableObject
                 {
                     // Ensure all tracks start inactive (SelectedTrack setter will activate)
                     track.IsActive = false;
+                    MigrateCurveTrack(track);
                     State.Field.Tracks.Add(track);
                     SavedTracks.Add(track);
 

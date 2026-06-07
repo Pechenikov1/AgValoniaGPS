@@ -26,6 +26,16 @@ public partial class MainViewModel
     /// </summary>
     public void ApplyGpsCycleResult(GpsCycleResult result)
     {
+        // PERF-05 Phase 2a. Cycle = one ApplyGpsCycleResult invocation on
+        // the UI thread (one per GpsCycleCompleted dispatch from the
+        // background pipeline). Captures everything from GpsDataRecorder
+        // through the final SetVehicleSteerAngle — all of the UI-thread
+        // state mirror + property change + binding-triggering work.
+        // Suspected source of the iPad "+13 ms outside OnRender" cost.
+        bool perfAgc = AgValoniaGPS.Models.Diagnostics.DiagFlags.PerfApplyGpsCycle;
+        long perfAgcT0 = perfAgc ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        long perfAgcA0 = perfAgc ? GC.GetAllocatedBytesForCurrentThread() : 0;
+
         // Record for debug dump (ring buffer, last 60 seconds at 10Hz)
         AgValoniaGPS.Services.Logging.GpsDataRecorder.Instance.Record(result);
 
@@ -33,15 +43,14 @@ public partial class MainViewModel
         if (result.GpsValid)
             _gpsService.MarkGpsReceived();
 
-        // GPS position
-        Latitude = result.Latitude;
-        Longitude = result.Longitude;
-        Easting = result.Easting;
-        Northing = result.Northing;
-        Heading = result.Heading;
-        _speed = result.Speed;
-        OnPropertyChanged(nameof(SpeedKmh));
-        RollDegrees = result.RollDegrees;
+        // PERF-05 Phase 2c #1: stop driving display-property PropertyChanged
+        // from sensor arrival. The MainViewModel.{Latitude, Longitude, Easting,
+        // Northing, Heading, _speed/SpeedKmh, RollDegrees, FixQuality} setters
+        // that used to live here have moved to OnDisplayTick (10 Hz, decoupled
+        // from sensor arrival). The cycle still writes State.Vehicle below —
+        // that's the canonical system of record the display tick samples from.
+        // For values not yet on State.Vehicle (RollDegrees), cache here.
+        _latestRollDegrees = result.RollDegrees;
 
         // Sole writer to State.Vehicle — Phase B completion. Was previously
         // also written from MainViewModel.HandleGpsUiUpdates on the
@@ -61,7 +70,6 @@ public partial class MainViewModel
             result.SatelliteCount,
             result.Hdop,
             result.DifferentialAge);
-        FixQuality = GetFixQualityString(result.FixQuality);
 
         // Tool position — set ToolEasting LAST to trigger map update
         ToolNorthing = result.ToolNorthing;
@@ -82,6 +90,8 @@ public partial class MainViewModel
         if (result.AutoSteerDisengagedThisCycle)
         {
             IsAutoSteerEngaged = false;
+            _autoSteerService.Disengage();
+            _audioService.Play(Services.Interfaces.SoundEffect.AutoSteerOff);
             StatusMessage = result.DisengageReason ?? "AutoSteer disengaged";
         }
 
@@ -117,8 +127,28 @@ public partial class MainViewModel
             sy.CurrentZone = yt.CurrentZone;
 
             _mapService.SetYouTurnPath(yt.TurnPath?.Select(p => (p.Easting, p.Northing)).ToList());
-            _mapService.SetNextTrack(yt.NextTrack);
+            // Reference-gate to match DisplayTrack/BaseTrack pattern below — yt.NextTrack
+            // is usually null and reused across cycles, so an unconditional push would
+            // re-dirty the GL track VBO every cycle and force a per-frame rebuild.
+            if (!ReferenceEquals(_lastMirroredNextTrack, yt.NextTrack))
+            {
+                _lastMirroredNextTrack = yt.NextTrack;
+                _mapService.SetNextTrack(yt.NextTrack);
+            }
             _mapService.SetIsInYouTurn(yt.IsExecuting);
+
+            // One-shot direction override: the state machine consumes
+            // and clears it inside the cycle, so once the snapshot
+            // reports null the UI cache must follow. Without this the
+            // UI's stale value would be re-written into the working
+            // state by GpsPipelineService.ProcessCycle every tick and
+            // bias every subsequent auto-armed turn with the operator's
+            // already-consumed intent.
+            if (!yt.NextUTurnDirectionLeftOverride.HasValue
+                && NextUTurnDirectionLeftOverride.HasValue)
+            {
+                NextUTurnDirectionLeftOverride = null;
+            }
         }
 
         if (result.Guidance is { } g)
@@ -204,6 +234,24 @@ public partial class MainViewModel
             State.Field.LocalPlane = result.FirstFixLocalPlane;
         }
 
+        // Origin guard: live GPS jumped beyond the temp-origin threshold while
+        // no field was loaded. Overwrite the existing observable plane (the
+        // cycle has already swapped its own cache) and surface a status toast.
+        if (result.ReplacementLocalPlane != null)
+        {
+            State.Field.LocalPlane = result.ReplacementLocalPlane;
+            StatusMessage =
+                $"GPS source moved {result.ReplacementDistanceKm:F0} km " +
+                $"from local origin; origin re-anchored.";
+        }
+
+        // Origin guard: live GPS far from the loaded field. Drop autosteer
+        // and prompt the operator for a close/keep-driving decision.
+        if (result.FarFromFieldWarning is { } w)
+        {
+            HandleFarFromFieldWarning(w);
+        }
+
         // Section states
         if (result.SectionStates != null)
         {
@@ -237,64 +285,60 @@ public partial class MainViewModel
         if (result.StatusMessage != null)
             StatusMessage = result.StatusMessage;
 
-        // Map service position update (single atomic call)
-        _mapService.SetAllPositions(
-            result.Easting, result.Northing, result.Heading * Math.PI / 180.0,
-            result.ToolEasting, result.ToolNorthing, result.ToolHeadingRadians,
-            result.ToolWidth, result.HitchEasting, result.HitchNorthing,
-            result.IsToolPositionReady);
+        // Map vehicle/tool/hitch positions are pushed by OnRenderPullTick at
+        // 30 Hz (vehicle dead-reckoned to "now" from the estimator, tool/hitch
+        // from the live ToolPositionService snapshot updated at 100 Hz by the
+        // control loop). The pipeline result captures stale values at
+        // pipeline-run time; pushing them here as well caused the implement to
+        // jitter back and forth at GPS rate as the stale write fought the
+        // live render-pull write.
+
+        // Live wheel angle for the front-wheel sprite (#336). Real WAS reading
+        // when an autosteer module is attached, simulator slider value when
+        // the sim is driving GPS. Both are in degrees and signed (+right).
+        double steerDeg = _isSimulatorEnabled
+            ? _simulatorService.SteerAngle
+            : _autoSteerService.LastSteerData.ActualSteerAngle;
+        _mapService.SetVehicleSteerAngle(steerDeg * Math.PI / 180.0);
+
+        if (perfAgc)
+        {
+            _perfAgcTicks += System.Diagnostics.Stopwatch.GetTimestamp() - perfAgcT0;
+            _perfAgcAllocs += GC.GetAllocatedBytesForCurrentThread() - perfAgcA0;
+            _perfAgcCount++;
+            var elapsed = (DateTime.UtcNow - _perfAgcWindowStart).TotalSeconds;
+            if (elapsed >= 1.0 && _perfAgcCount > 0)
+            {
+                double ticksPerUs = System.Diagnostics.Stopwatch.Frequency / 1_000_000.0;
+                Console.WriteLine(
+                    $"[ApplyGpsCycle-PERF] cycles={_perfAgcCount}"
+                    + $" us/cycle={(_perfAgcTicks / ticksPerUs / _perfAgcCount):F1}"
+                    + $" alloc/cycle={(_perfAgcAllocs / _perfAgcCount)}B"
+                    + $" total_us={(long)(_perfAgcTicks / ticksPerUs)}"
+                    + $" total_alloc={_perfAgcAllocs}B"
+                    + $" window={elapsed:F2}s");
+                _perfAgcTicks = 0;
+                _perfAgcAllocs = 0;
+                _perfAgcCount = 0;
+                _perfAgcWindowStart = DateTime.UtcNow;
+            }
+        }
     }
+
+    // PERF-05 Phase 2a accumulators (gated by DiagFlags.PerfApplyGpsCycle).
+    private long _perfAgcTicks;
+    private long _perfAgcAllocs;
+    private int _perfAgcCount;
+    private DateTime _perfAgcWindowStart = DateTime.UtcNow;
 
     private void UpdateSectionPropertiesFromResult(bool[] states, int[]? colorCodes)
     {
-        int count = Math.Min(states.Length, 16);
+        // The section bar binds to per-button ColorCode. The pipeline supplies
+        // the authoritative 6-state codes each cycle; apply them to the stable
+        // button objects (sized to NumSections by RebuildSectionRows).
+        if (colorCodes == null) return;
+        int count = Math.Min(_sectionButtons.Count, colorCodes.Length);
         for (int i = 0; i < count; i++)
-        {
-            switch (i)
-            {
-                case 0: Section1Active = states[0]; break;
-                case 1: Section2Active = states[1]; break;
-                case 2: Section3Active = states[2]; break;
-                case 3: Section4Active = states[3]; break;
-                case 4: Section5Active = states[4]; break;
-                case 5: Section6Active = states[5]; break;
-                case 6: Section7Active = states[6]; break;
-                case 7: Section8Active = states[7]; break;
-                case 8: Section9Active = states[8]; break;
-                case 9: Section10Active = states[9]; break;
-                case 10: Section11Active = states[10]; break;
-                case 11: Section12Active = states[11]; break;
-                case 12: Section13Active = states[12]; break;
-                case 13: Section14Active = states[13]; break;
-                case 14: Section15Active = states[14]; break;
-                case 15: Section16Active = states[15]; break;
-            }
-        }
-
-        if (colorCodes != null)
-        {
-            for (int i = 0; i < Math.Min(colorCodes.Length, count); i++)
-            {
-                switch (i)
-                {
-                    case 0: Section1ColorCode = colorCodes[0]; break;
-                    case 1: Section2ColorCode = colorCodes[1]; break;
-                    case 2: Section3ColorCode = colorCodes[2]; break;
-                    case 3: Section4ColorCode = colorCodes[3]; break;
-                    case 4: Section5ColorCode = colorCodes[4]; break;
-                    case 5: Section6ColorCode = colorCodes[5]; break;
-                    case 6: Section7ColorCode = colorCodes[6]; break;
-                    case 7: Section8ColorCode = colorCodes[7]; break;
-                    case 8: Section9ColorCode = colorCodes[8]; break;
-                    case 9: Section10ColorCode = colorCodes[9]; break;
-                    case 10: Section11ColorCode = colorCodes[10]; break;
-                    case 11: Section12ColorCode = colorCodes[11]; break;
-                    case 12: Section13ColorCode = colorCodes[12]; break;
-                    case 13: Section14ColorCode = colorCodes[13]; break;
-                    case 14: Section15ColorCode = colorCodes[14]; break;
-                    case 15: Section16ColorCode = colorCodes[15]; break;
-                }
-            }
-        }
+            _sectionButtons[i].ColorCode = colorCodes[i];
     }
 }

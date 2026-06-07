@@ -21,7 +21,10 @@ using System.Threading.Tasks;
 using System.Windows.Input;
 
 using AgValoniaGPS.Models;
+using AgValoniaGPS.Models.Base;
 using AgValoniaGPS.Models.Configuration;
+using AgValoniaGPS.Models.YouTurn;
+using AgValoniaGPS.Models.State;
 using AgValoniaGPS.Services.Interfaces;
 using CommunityToolkit.Mvvm.Input;
 
@@ -37,16 +40,9 @@ public partial class ConfigurationViewModel : ObservableObject
 {
     private readonly IConfigurationService _configService;
 
-    #region Dialog Visibility
-
-    private bool _isDialogVisible;
-    public bool IsDialogVisible
-    {
-        get => _isDialogVisible;
-        set => SetProperty(ref _isDialogVisible, value);
-    }
-
-    #endregion
+    // Dialog visibility is driven by UIState.ActiveDialog (chain navigation);
+    // the split Vehicle/Tool config dialogs bind to State.UI.IsVehicleConfigDialogVisible /
+    // IsToolConfigDialogVisible. This VM only owns the config data + Apply/Cancel.
 
     #region Numeric Input Dialog
 
@@ -504,6 +500,9 @@ public partial class ConfigurationViewModel : ObservableObject
     public GuidanceConfig Guidance => Config.Guidance;
     public DisplayConfig Display => Config.Display;
     public SimulatorConfig Simulator => Config.Simulator;
+
+    /// <summary>Persistent application state (day/night value, etc.) — survives restart.</summary>
+    public PersistentAppState PersistentState => PersistentAppState.Instance;
     public ConnectionConfig Connections => Config.Connections;
     public AhrsConfig Ahrs => Config.Ahrs;
     public MachineConfig Machine => Config.Machine;
@@ -517,6 +516,60 @@ public partial class ConfigurationViewModel : ObservableObject
         "Section 13", "Section 14", "Section 15", "Section 16",
         "Hyd Up", "Hyd Down", "Tram Left", "Tram Right", "Geo Stop"
     };
+
+    // ISO 11783 hitch/coupling types, in code order (list index = ISO code + 1, so
+    // index 0 = code -1 "Not available", index 1 = code 0 "Unknown", ...). The combo
+    // shows these descriptions; SelectedHitchType maps to/from Tool.HitchType (the code).
+    public ObservableCollection<string> HitchTypeOptions { get; } = new()
+    {
+        "Not available",
+        "Unknown",
+        "ISO 6489-3 Tractor drawbar",
+        "ISO 730 Three-point-hitch semi-mounted",
+        "ISO 730 Three-point-hitch mounted",
+        "ISO 6489-1 Hitch-hook",
+        "ISO 6489-2 Clevis coupling 40",
+        "ISO 6489-4 Piton type coupling",
+        "ISO 6489-5 CUNA hitch",
+        "ISO 24347 Ball type hitch",
+        "Chassis Mounted - Self-Propelled",
+        "ISO 5692-2 Pivot wagon hitch"
+    };
+
+    public string SelectedHitchType
+    {
+        get
+        {
+            int index = Tool.HitchType + 1; // code -1 -> index 0
+            return index >= 0 && index < HitchTypeOptions.Count
+                ? HitchTypeOptions[index]
+                : HitchTypeOptions[1]; // fall back to "Unknown"
+        }
+        set
+        {
+            int index = HitchTypeOptions.IndexOf(value);
+            Tool.HitchType = index >= 0 ? index - 1 : 0;
+            OnPropertyChanged();
+        }
+    }
+
+    // Tractor-side hitch/coupling type (same ISO list as the tool side).
+    public string SelectedVehicleHitchType
+    {
+        get
+        {
+            int index = Vehicle.HitchType + 1;
+            return index >= 0 && index < HitchTypeOptions.Count
+                ? HitchTypeOptions[index]
+                : HitchTypeOptions[1];
+        }
+        set
+        {
+            int index = HitchTypeOptions.IndexOf(value);
+            Vehicle.HitchType = index >= 0 ? index - 1 : 0;
+            OnPropertyChanged();
+        }
+    }
 
     // Individual pin function properties for binding
     public string Pin1Function { get => GetPinFunctionName(0); set => SetPinFunctionByName(0, value); }
@@ -647,7 +700,7 @@ public partial class ConfigurationViewModel : ObservableObject
             {
                 // Individual sections mode - sum actual widths
                 double total = 0;
-                for (int i = 0; i < Config.NumSections && i < 16; i++)
+                for (int i = 0; i < Config.NumSections && i < Models.Configuration.ToolConfig.MaxSections; i++)
                     total += Tool.GetSectionWidth(i);
                 return total / 100.0; // cm to meters
             }
@@ -659,8 +712,54 @@ public partial class ConfigurationViewModel : ObservableObject
         }
     }
 
+    // ── Units (#417) ──────────────────────────────────────────────────
+    // Widths are stored in cm; totals in meters. When the user selects
+    // Imperial, section widths display/edit in inches and totals in feet.
+    // Conversion happens only here at the display/input boundary — the
+    // model stays metric. All of these are reactive: raised on IsMetric,
+    // NumSections, DefaultSectionWidth, and individual width edits.
+
+    /// <summary>Unit suffix for individual section widths ("cm" / "in").</summary>
+    public string SectionWidthUnit => Config.IsMetric ? "cm" : "in";
+
+    /// <summary>Numeric format for section widths (cm whole, inches 1 dp).</summary>
+    public string SectionWidthFormat => Config.IsMetric ? "F0" : "F1";
+
+    /// <summary>Footer caption under the section-width grid.</summary>
+    public string SectionWidthUnitLabel => Config.IsMetric ? "All widths in cm" : "All widths in inches";
+
+    /// <summary>Default section width in the current display unit (TwoWay).</summary>
+    public double DefaultSectionWidthDisplay
+    {
+        get => Config.IsMetric
+            ? Tool.DefaultSectionWidth
+            : UnitConversion.CmToInches(Tool.DefaultSectionWidth);
+        set
+        {
+            Tool.DefaultSectionWidth = Config.IsMetric ? value : UnitConversion.InchesToCm(value);
+        }
+    }
+
+    /// <summary>Formatted total tool width with unit ("16.00 m" / "52.49 ft").
+    /// Used by both the in-tab total and the dialog footer — replaces the
+    /// stale, non-notifying Config.ActualToolWidth binding (#417 math bug).</summary>
+    public string CalculatedTotalWidthText
+    {
+        get
+        {
+            double meters = CalculatedSectionTotal;
+            return Config.IsMetric
+                ? $"{meters:F2} m"
+                : $"{UnitConversion.MetersToFeet(meters):F2} ft";
+        }
+    }
+
+    private string FormatSectionWidth(double cm) => Config.IsMetric
+        ? cm.ToString("F0", CultureInfo.InvariantCulture)
+        : UnitConversion.CmToInches(cm).ToString("F1", CultureInfo.InvariantCulture);
+
     /// <summary>
-    /// Gets the width of a specific section for display (1-based index).
+    /// Gets the width of a specific section for display (1-based index), in cm.
     /// </summary>
     public double GetSectionWidthForDisplay(int sectionNumber)
     {
@@ -669,24 +768,24 @@ public partial class ConfigurationViewModel : ObservableObject
     }
 
     /// <summary>
-    /// Section width display properties for binding (1-based).
+    /// Section width display strings for binding (1-based), in current units.
     /// </summary>
-    public double Section1Width => Tool.GetSectionWidth(0);
-    public double Section2Width => Tool.GetSectionWidth(1);
-    public double Section3Width => Tool.GetSectionWidth(2);
-    public double Section4Width => Tool.GetSectionWidth(3);
-    public double Section5Width => Tool.GetSectionWidth(4);
-    public double Section6Width => Tool.GetSectionWidth(5);
-    public double Section7Width => Tool.GetSectionWidth(6);
-    public double Section8Width => Tool.GetSectionWidth(7);
-    public double Section9Width => Tool.GetSectionWidth(8);
-    public double Section10Width => Tool.GetSectionWidth(9);
-    public double Section11Width => Tool.GetSectionWidth(10);
-    public double Section12Width => Tool.GetSectionWidth(11);
-    public double Section13Width => Tool.GetSectionWidth(12);
-    public double Section14Width => Tool.GetSectionWidth(13);
-    public double Section15Width => Tool.GetSectionWidth(14);
-    public double Section16Width => Tool.GetSectionWidth(15);
+    public string Section1Width => FormatSectionWidth(Tool.GetSectionWidth(0));
+    public string Section2Width => FormatSectionWidth(Tool.GetSectionWidth(1));
+    public string Section3Width => FormatSectionWidth(Tool.GetSectionWidth(2));
+    public string Section4Width => FormatSectionWidth(Tool.GetSectionWidth(3));
+    public string Section5Width => FormatSectionWidth(Tool.GetSectionWidth(4));
+    public string Section6Width => FormatSectionWidth(Tool.GetSectionWidth(5));
+    public string Section7Width => FormatSectionWidth(Tool.GetSectionWidth(6));
+    public string Section8Width => FormatSectionWidth(Tool.GetSectionWidth(7));
+    public string Section9Width => FormatSectionWidth(Tool.GetSectionWidth(8));
+    public string Section10Width => FormatSectionWidth(Tool.GetSectionWidth(9));
+    public string Section11Width => FormatSectionWidth(Tool.GetSectionWidth(10));
+    public string Section12Width => FormatSectionWidth(Tool.GetSectionWidth(11));
+    public string Section13Width => FormatSectionWidth(Tool.GetSectionWidth(12));
+    public string Section14Width => FormatSectionWidth(Tool.GetSectionWidth(13));
+    public string Section15Width => FormatSectionWidth(Tool.GetSectionWidth(14));
+    public string Section16Width => FormatSectionWidth(Tool.GetSectionWidth(15));
 
     // Section color properties (for color preview display)
     public uint SectionColor1 => Tool.GetSectionColor(0);
@@ -733,6 +832,21 @@ public partial class ConfigurationViewModel : ObservableObject
         OnPropertyChanged(nameof(Section15Width));
         OnPropertyChanged(nameof(Section16Width));
         OnPropertyChanged(nameof(CalculatedSectionTotal));
+        OnPropertyChanged(nameof(CalculatedTotalWidthText));
+    }
+
+    /// <summary>
+    /// Re-raise every unit-dependent display property after a metric/imperial
+    /// switch so widths and totals re-render in the new unit (#417).
+    /// </summary>
+    private void RefreshUnitDependentProperties()
+    {
+        OnPropertyChanged(nameof(SectionWidthUnit));
+        OnPropertyChanged(nameof(SectionWidthFormat));
+        OnPropertyChanged(nameof(SectionWidthUnitLabel));
+        OnPropertyChanged(nameof(DefaultSectionWidthDisplay));
+        OnPropertyChanged(nameof(CalculatedTotalWidthText));
+        RefreshSectionWidthProperties();
     }
 
     // Zone end section properties (for binding in zone mode)
@@ -764,22 +878,6 @@ public partial class ConfigurationViewModel : ObservableObject
 
     #region Profile Management
 
-    public ObservableCollection<string> AvailableProfiles { get; } = new();
-
-    private string? _selectedProfileName;
-    public string? SelectedProfileName
-    {
-        get => _selectedProfileName;
-        set
-        {
-            SetProperty(ref _selectedProfileName, value);
-            if (value != null && value != Config.ActiveProfileName)
-            {
-                _configService.LoadProfile(value);
-            }
-        }
-    }
-
     /// <summary>
     /// Whether there are unsaved changes (delegates to ConfigurationStore)
     /// </summary>
@@ -793,10 +891,6 @@ public partial class ConfigurationViewModel : ObservableObject
 
     #region Commands
 
-    public ICommand LoadProfileCommand { get; }
-    public ICommand SaveProfileCommand { get; }
-    public ICommand NewProfileCommand { get; }
-    public ICommand DeleteProfileCommand { get; }
     public ICommand ApplyCommand { get; }
     public ICommand CancelCommand { get; }
     public ICommand SetToolTypeCommand { get; }
@@ -871,6 +965,16 @@ public partial class ConfigurationViewModel : ObservableObject
     public ICommand EditUTurnSkipWidthCommand { get; private set; } = null!;
     public ICommand EditUTurnSmoothingCommand { get; private set; } = null!;
 
+    // U-Turn style selector (0 = Omega/Albin, 2 = Sagitta)
+    public ICommand SetOmegaTurnStyleCommand { get; private set; } = null!;
+    public ICommand SetSagittaTurnStyleCommand { get; private set; } = null!;
+
+    /// <summary>True when the active U-turn style is Omega (or any non-Sagitta style).</summary>
+    public bool IsOmegaTurnStyle => Guidance.UTurnStyle != (int)YouTurnType.SagittaStyle;
+
+    /// <summary>True when the active U-turn style is Sagitta.</summary>
+    public bool IsSagittaTurnStyle => Guidance.UTurnStyle == (int)YouTurnType.SagittaStyle;
+
     // GPS Tab Commands
     public ICommand SetSingleGpsCommand { get; private set; } = null!;
     public ICommand SetDualGpsCommand { get; private set; } = null!;
@@ -932,6 +1036,7 @@ public partial class ConfigurationViewModel : ObservableObject
     public event Action<bool>? FullscreenChanged;
     public ICommand ToggleElevationLogCommand { get; private set; } = null!;
     public ICommand ToggleFieldTextureCommand { get; private set; } = null!;
+    public ICommand ToggleFieldTextureMoveableCommand { get; private set; } = null!;
     public ICommand ToggleGridCommand { get; private set; } = null!;
     public ICommand ToggleExtraGuidelinesCommand { get; private set; } = null!;
     public ICommand EditExtraGuidelinesCountCommand { get; private set; } = null!;
@@ -956,7 +1061,6 @@ public partial class ConfigurationViewModel : ObservableObject
     #region Events
 
     public event EventHandler? CloseRequested;
-    public event EventHandler<string>? ProfileSaved;
 
     #endregion
 
@@ -965,10 +1069,6 @@ public partial class ConfigurationViewModel : ObservableObject
         _configService = configService;
 
         // Initialize commands
-        LoadProfileCommand = new RelayCommand<string>(LoadProfile);
-        SaveProfileCommand = new RelayCommand(SaveProfile);
-        NewProfileCommand = new RelayCommand<string>(CreateNewProfile);
-        DeleteProfileCommand = new RelayCommand(DeleteProfile);
         ApplyCommand = new RelayCommand(ApplyChanges);
         CancelCommand = new RelayCommand(Cancel);
         SetToolTypeCommand = new RelayCommand<string>(SetToolType);
@@ -998,10 +1098,17 @@ public partial class ConfigurationViewModel : ObservableObject
             {
                 OnPropertyChanged(nameof(HasUnsavedChanges));
             }
-            // Update calculated section total when NumSections changes
+            // Update calculated section total when NumSections changes.
+            // Also refresh the per-section displays so sections newly seeded
+            // with the Default Section Width render their seeded value (#417).
             if (e.PropertyName == nameof(ConfigurationStore.NumSections))
             {
-                OnPropertyChanged(nameof(CalculatedSectionTotal));
+                RefreshSectionWidthProperties();
+            }
+            // Re-render all widths/totals in the new unit on metric switch (#417)
+            if (e.PropertyName == nameof(ConfigurationStore.IsMetric))
+            {
+                RefreshUnitDependentProperties();
             }
         };
 
@@ -1011,14 +1118,11 @@ public partial class ConfigurationViewModel : ObservableObject
             if (e.PropertyName == nameof(ToolConfig.DefaultSectionWidth))
             {
                 OnPropertyChanged(nameof(CalculatedSectionTotal));
+                OnPropertyChanged(nameof(CalculatedTotalWidthText));
+                OnPropertyChanged(nameof(DefaultSectionWidthDisplay));
             }
         };
 
-        // Load available profiles
-        RefreshProfileList();
-
-        // Set selected profile name to current
-        _selectedProfileName = Config.ActiveProfileName;
     }
 
     private void InitializeVehicleEditCommands()
@@ -1034,10 +1138,12 @@ public partial class ConfigurationViewModel : ObservableObject
                 v => Vehicle.TrackWidth = v,
                 "m", integerOnly: false, allowNegative: false, min: 0.5, max: 5));
 
+        // Vehicle hitch (#1): rear axle center -> tractor hitch pin. Used by trailing/TBT
+        // tools. Positive distance behind the axle; geometry applies the sign.
         EditHitchLengthCommand = new RelayCommand(() =>
-            ShowNumericInput("Hitch Length", Tool.HitchLength,
-                v => Tool.HitchLength = v,
-                "m", integerOnly: false, allowNegative: true, min: -15, max: 15));
+            ShowNumericInput("Tractor Hitch Length", Vehicle.HitchLength,
+                v => Vehicle.HitchLength = v,
+                "m", integerOnly: false, allowNegative: false, min: 0, max: 15));
 
         EditAntennaPivotCommand = new RelayCommand(() =>
             ShowNumericInput("Antenna Pivot", Vehicle.AntennaPivot,
@@ -1096,8 +1202,10 @@ public partial class ConfigurationViewModel : ObservableObject
                 v => Tool.Offset = v,
                 "m", integerOnly: false, allowNegative: true, min: -5, max: 5));
 
+        // Rigid tool (#2/#3): axle center -> implement working center (tiller/disc shaft).
+        // Tool-dependent; used only by front/rear-fixed tools.
         EditToolHitchLengthCommand = new RelayCommand(() =>
-            ShowNumericInput("Hitch Length", Tool.HitchLength,
+            ShowNumericInput("Working Center Distance", Tool.HitchLength,
                 v => Tool.HitchLength = v,
                 "m", integerOnly: false, allowNegative: true, min: -15, max: 15));
 
@@ -1141,7 +1249,8 @@ public partial class ConfigurationViewModel : ObservableObject
         EditNumSectionsCommand = new RelayCommand(() =>
             ShowNumericInput("Number of Sections", Config.NumSections,
                 v => Config.NumSections = (int)v,
-                "", integerOnly: true, allowNegative: false, min: 1, max: 16));
+                "", integerOnly: true, allowNegative: false, min: 1,
+                max: Models.Configuration.ToolConfig.MaxSections));
 
         EditLookAheadOnCommand = new RelayCommand(() =>
             ShowNumericInput("Look Ahead On", Tool.LookAheadOnSetting,
@@ -1159,9 +1268,16 @@ public partial class ConfigurationViewModel : ObservableObject
                 "s", integerOnly: false, allowNegative: false, min: 0, max: 5));
 
         EditDefaultSectionWidthCommand = new RelayCommand(() =>
-            ShowNumericInput("Default Section Width", Tool.DefaultSectionWidth,
-                v => Tool.DefaultSectionWidth = v,
-                "cm", integerOnly: false, allowNegative: false, min: 10, max: 500));
+        {
+            bool metric = Config.IsMetric;
+            // Stored cm bounds 10..500 → inches 3.9..196.9
+            ShowNumericInput("Default Section Width",
+                metric ? Tool.DefaultSectionWidth : UnitConversion.CmToInches(Tool.DefaultSectionWidth),
+                v => Tool.DefaultSectionWidth = metric ? v : UnitConversion.InchesToCm(v),
+                metric ? "cm" : "in", integerOnly: false, allowNegative: false,
+                min: metric ? 10 : UnitConversion.CmToInches(10),
+                max: metric ? 500 : UnitConversion.CmToInches(500));
+        });
 
         EditMinCoverageCommand = new RelayCommand(() =>
             ShowNumericInput("Minimum Coverage", Tool.MinCoverage,
@@ -1219,14 +1335,19 @@ public partial class ConfigurationViewModel : ObservableObject
     private void EditSectionWidth(int sectionNumber)
     {
         int index = sectionNumber - 1;
-        double currentWidth = Tool.GetSectionWidth(index);
-        ShowNumericInput($"Section {sectionNumber} Width", currentWidth,
+        bool metric = Config.IsMetric;
+        double currentCm = Tool.GetSectionWidth(index);
+        // Stored cm bounds 1..500 → inches 0.4..196.9
+        ShowNumericInput($"Section {sectionNumber} Width",
+            metric ? currentCm : UnitConversion.CmToInches(currentCm),
             v =>
             {
-                Tool.SetSectionWidth(index, v);
+                Tool.SetSectionWidth(index, metric ? v : UnitConversion.InchesToCm(v));
                 RefreshSectionWidthProperties();
             },
-            "cm", integerOnly: false, allowNegative: false, min: 1, max: 500);
+            metric ? "cm" : "in", integerOnly: false, allowNegative: false,
+            min: metric ? 1 : UnitConversion.CmToInches(1),
+            max: metric ? 500 : UnitConversion.CmToInches(500));
     }
 
     /// <summary>
@@ -1275,6 +1396,21 @@ public partial class ConfigurationViewModel : ObservableObject
             ShowNumericInput("Smoothing", Guidance.UTurnSmoothing,
                 v => Guidance.UTurnSmoothing = (int)v,
                 "", integerOnly: true, allowNegative: false, min: 1, max: 50));
+
+        SetOmegaTurnStyleCommand = new RelayCommand(() => SetTurnStyle((int)YouTurnType.AlbinStyle));
+        SetSagittaTurnStyleCommand = new RelayCommand(() => SetTurnStyle((int)YouTurnType.SagittaStyle));
+    }
+
+    /// <summary>
+    /// Sets the persisted U-turn style, persists the change, and refreshes the
+    /// selector's bound state so the cards re-highlight.
+    /// </summary>
+    private void SetTurnStyle(int style)
+    {
+        Guidance.UTurnStyle = style;
+        Config.MarkChanged();
+        OnPropertyChanged(nameof(IsOmegaTurnStyle));
+        OnPropertyChanged(nameof(IsSagittaTurnStyle));
     }
 
     private void InitializeGpsEditCommands()
@@ -1576,6 +1712,12 @@ public partial class ConfigurationViewModel : ObservableObject
             Config.MarkChanged();
         });
 
+        ToggleFieldTextureMoveableCommand = new RelayCommand(() =>
+        {
+            Display.FieldTextureMoveable = !Display.FieldTextureMoveable;
+            Config.MarkChanged();
+        });
+
         ToggleGridCommand = new RelayCommand(() =>
         {
             Display.GridVisible = !Display.GridVisible;
@@ -1613,9 +1755,9 @@ public partial class ConfigurationViewModel : ObservableObject
 
         ToggleDayNightThemeCommand = new RelayCommand(() =>
         {
-            Display.IsDayMode = !Display.IsDayMode;
-            MainViewModel.ApplyThemeVariant(Display.IsDayMode);
-            Config.MarkChanged();
+            // Day/night current value is persistent STATE, not config.
+            PersistentState.IsDayMode = !PersistentState.IsDayMode;
+            MainViewModel.ApplyThemeVariant(PersistentState.IsDayMode);
         });
 
         SetMetricUnitsCommand = new RelayCommand(() =>
@@ -1679,51 +1821,9 @@ public partial class ConfigurationViewModel : ObservableObject
         });
     }
 
-    private void RefreshProfileList()
-    {
-        AvailableProfiles.Clear();
-        foreach (var profileName in _configService.GetAvailableProfiles())
-        {
-            AvailableProfiles.Add(profileName);
-        }
-    }
-
-    private void LoadProfile(string? profileName)
-    {
-        if (string.IsNullOrEmpty(profileName)) return;
-        _configService.LoadProfile(profileName);
-        _selectedProfileName = profileName;
-        OnPropertyChanged(nameof(SelectedProfileName));
-    }
-
-    private void SaveProfile()
-    {
-        _configService.SaveProfile(Config.ActiveProfileName);
-        ProfileSaved?.Invoke(this, Config.ActiveProfileName);
-    }
-
-    private void CreateNewProfile(string? profileName)
-    {
-        if (string.IsNullOrWhiteSpace(profileName)) return;
-
-        _configService.CreateProfile(profileName);
-        RefreshProfileList();
-        _selectedProfileName = profileName;
-        OnPropertyChanged(nameof(SelectedProfileName));
-    }
-
-    private void DeleteProfile()
-    {
-        if (string.IsNullOrEmpty(SelectedProfileName)) return;
-        if (SelectedProfileName == Config.ActiveProfileName) return; // Can't delete active
-
-        _configService.DeleteProfile(SelectedProfileName);
-        RefreshProfileList();
-    }
-
     private void ApplyChanges()
     {
-        _configService.SaveProfile(Config.ActiveProfileName);
+        _configService.SaveProfiles(Config.ActiveVehicleProfileName, Config.ActiveToolProfileName);
         CloseRequested?.Invoke(this, EventArgs.Empty);
     }
 

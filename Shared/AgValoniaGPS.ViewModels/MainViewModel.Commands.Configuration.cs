@@ -29,21 +29,40 @@ public partial class MainViewModel
 {
     private void InitializeConfigurationCommands()
     {
-        // Configuration Dialog
-        ShowConfigurationDialogCommand = new RelayCommand(() =>
+        // Split Vehicle / Tool configuration dialogs — chained sub-dialogs of the
+        // picker. A single ConfigurationViewModel backs both (they edit the same live
+        // store). Pushed onto the chain so Back returns to the picker.
+        ShowVehicleConfigDialogCommand = new RelayCommand(() =>
         {
-            ConfigurationViewModel = new ConfigurationViewModel(_configurationService);
-            ConfigurationViewModel.CloseRequested += (s, e) =>
-            {
-                ConfigurationViewModel.IsDialogVisible = false;
-            };
-            ConfigurationViewModel.IsDialogVisible = true;
+            EnsureConfigurationViewModel();
+            PushChainDialog(DialogType.VehicleConfig);
         });
 
-        CancelConfigurationDialogCommand = new RelayCommand(() =>
+        ShowToolConfigDialogCommand = new RelayCommand(() =>
         {
-            if (ConfigurationViewModel != null)
-                ConfigurationViewModel.IsDialogVisible = false;
+            EnsureConfigurationViewModel();
+            PushChainDialog(DialogType.ToolConfig);
+        });
+
+        // Load Vehicle / Tool picker (#346) — the hub, opened directly from the gear
+        // icon as the root of the config chain. Its "Configure Vehicle" / "Configure
+        // Tool" buttons push the split dialogs onto the chain.
+        ShowLoadVehicleToolDialogCommand = new RelayCommand(() =>
+        {
+            LoadVehicleToolDialogVm = new LoadVehicleToolDialogViewModel(
+                _configurationService,
+                onClose: () => State.UI.CloseDialog(),
+                confirm: (msg, action) => ShowConfirmationDialog("Confirm", msg, action),
+                confirmChoice: (msg, confirmLabel, cancelLabel, action) =>
+                    ShowConfirmationDialog("Profile Damaged", msg, confirmLabel, cancelLabel, action),
+                onConfigureVehicle: () => ShowVehicleConfigDialogCommand!.Execute(null),
+                onConfigureTool: () => ShowToolConfigDialogCommand!.Execute(null));
+            OpenChainDialog(DialogType.LoadVehicleTool);
+        });
+
+        CancelLoadVehicleToolDialogCommand = new RelayCommand(() =>
+        {
+            State.UI.CloseDialog();
         });
 
         // AutoSteer Configuration Panel
@@ -73,51 +92,21 @@ public partial class MainViewModel
         {
             State.UI.CloseDialog();
         });
+    }
 
-        // Profile management
-        ShowLoadProfileDialogCommand = new RelayCommand(() =>
-        {
-            AvailableProfiles.Clear();
-            foreach (var profile in _configurationService.GetAvailableProfiles())
-            {
-                AvailableProfiles.Add(profile);
-            }
-            SelectedProfile = _configurationService.Store.ActiveProfileName;
-            IsProfileSelectionVisible = true;
-        });
+    /// <summary>
+    /// Lazily construct the shared ConfigurationViewModel that backs both the
+    /// Vehicle and Tool dialogs, wiring CloseRequested (Apply/Cancel) to hide
+    /// whichever split dialog is open.
+    /// </summary>
+    private void EnsureConfigurationViewModel()
+    {
+        if (ConfigurationViewModel != null)
+            return;
 
-        LoadSelectedProfileCommand = new RelayCommand(() =>
-        {
-            if (!string.IsNullOrEmpty(SelectedProfile))
-            {
-                _configurationService.LoadProfile(SelectedProfile);
-                _settingsService.Settings.LastUsedVehicleProfile = SelectedProfile;
-                _settingsService.Save();
-                OnPropertyChanged(nameof(CurrentProfileName));
-            }
-            IsProfileSelectionVisible = false;
-        });
-
-        CancelProfileSelectionCommand = new RelayCommand(() =>
-        {
-            IsProfileSelectionVisible = false;
-        });
-
-        ShowNewProfileDialogCommand = new RelayCommand(() =>
-        {
-            var baseName = "New Profile";
-            var profileName = baseName;
-            var counter = 1;
-            var existingProfiles = _configurationService.GetAvailableProfiles();
-            while (existingProfiles.Contains(profileName))
-            {
-                profileName = $"{baseName} {counter++}";
-            }
-
-            _configurationService.CreateProfile(profileName);
-            _settingsService.Settings.LastUsedVehicleProfile = profileName;
-            _settingsService.Save();
-            OnPropertyChanged(nameof(CurrentProfileName));
-        });
+        ConfigurationViewModel = new ConfigurationViewModel(_configurationService);
+        // Apply/Cancel inside the config dialog dismiss the whole config chain back
+        // to the map (the picker has already applied the profile selection).
+        ConfigurationViewModel.CloseRequested += (s, e) => CloseChain();
     }
 }

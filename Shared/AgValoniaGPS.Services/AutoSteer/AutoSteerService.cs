@@ -15,8 +15,10 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 using System;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using AgValoniaGPS.Models;
 using AgValoniaGPS.Models.Base;
 using AgValoniaGPS.Models.Configuration;
@@ -68,6 +70,29 @@ public class AutoSteerService : IAutoSteerService
     private bool _isEnabled;
     private bool _isEngaged;
 
+    // Config-change → PGN 251/252 emission. The wizard and the
+    // AutoSteer config dialog both mutate ConfigStore.AutoSteer (and
+    // Tool.IsSteerSwitchEnabled); previously only the dialog's
+    // Apply/Reset paths emitted the PGNs. Result: wizard-step writes
+    // weren't visible to the module/simulator until the dialog was
+    // opened. This service is the single owner of the emit: subscribe
+    // to PropertyChanged, debounce, and re-emit both PGNs.
+    private readonly Timer _configEmitTimer;
+    private int _configEmitDelayMs = 150;
+    private bool _configSubscribed;
+    private AutoSteerConfig? _subscribedAutoSteer;
+    private ToolConfig? _subscribedTool;
+
+    /// <summary>
+    /// Test seam: lets tests shorten the debounce so they don't have
+    /// to sleep the wall clock to observe coalescing behaviour.
+    /// </summary>
+    internal int ConfigEmitDebounceMilliseconds
+    {
+        get => _configEmitDelayMs;
+        set => _configEmitDelayMs = value;
+    }
+
     public event EventHandler<VehicleStateSnapshot>? StateUpdated;
 
     public bool IsEnabled => _isEnabled;
@@ -89,6 +114,15 @@ public class AutoSteerService : IAutoSteerService
         // Initialize state
         _state = new VehicleState();
         _guidanceInput = new TrackInput();
+
+        // Debounce timer: parked Infinite until a PropertyChanged event
+        // arms it. Coalesces bursts (Reset-to-Defaults touches many
+        // fields in quick succession; we want exactly one PGN emit
+        // pair, not one per field).
+        _configEmitTimer = new Timer(_ => EmitSteerConfigPgns(),
+            state: null,
+            dueTime: Timeout.Infinite,
+            period: Timeout.Infinite);
     }
 
     /// <summary>
@@ -113,13 +147,75 @@ public class AutoSteerService : IAutoSteerService
     {
         _isEnabled = true;
         _udpService.DataReceived += OnUdpDataReceived;
+
+        // Subscribe before the initial emission so a settings write that
+        // races against startup still re-fires through the debounce.
+        SubscribeToConfigChanges();
+
+        // Initial baseline: send current ConfigStore.AutoSteer values
+        // once so the module / simulator sees them without waiting for
+        // the operator to touch a setting. Prevents the "simulator's
+        // Steer Switch toggle stays greyed until I open the AutoSteer
+        // config dialog" symptom — the simulator reads switch-type from
+        // PGN 251 byte 5 and we'd previously never send it on startup.
+        EmitSteerConfigPgns();
     }
 
     public void Stop()
     {
         _udpService.DataReceived -= OnUdpDataReceived;
+        UnsubscribeFromConfigChanges();
         _isEnabled = false;
         _isEngaged = false;
+    }
+
+    private void SubscribeToConfigChanges()
+    {
+        if (_configSubscribed) return;
+        _subscribedAutoSteer = ConfigurationStore.Instance.AutoSteer;
+        _subscribedTool = ConfigurationStore.Instance.Tool;
+        _subscribedAutoSteer.PropertyChanged += OnConfigPropertyChanged;
+        _subscribedTool.PropertyChanged += OnConfigPropertyChanged;
+        _configSubscribed = true;
+    }
+
+    private void UnsubscribeFromConfigChanges()
+    {
+        if (!_configSubscribed) return;
+        if (_subscribedAutoSteer != null)
+            _subscribedAutoSteer.PropertyChanged -= OnConfigPropertyChanged;
+        if (_subscribedTool != null)
+            _subscribedTool.PropertyChanged -= OnConfigPropertyChanged;
+        _configSubscribed = false;
+    }
+
+    /// <summary>
+    /// PropertyChanged handler for AutoSteer / Tool config. Any change
+    /// re-arms the debounce timer; the timer fires the actual PGN
+    /// emission once the storm subsides. PGN 251 and 252 are always
+    /// emitted as a pair — the cost is two small UDP packets, and
+    /// splitting "which PGN does this property belong to" would
+    /// duplicate the bit-packing knowledge from <c>PgnBuilder</c>.
+    /// </summary>
+    private void OnConfigPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        _configEmitTimer.Change(_configEmitDelayMs, Timeout.Infinite);
+    }
+
+    private void EmitSteerConfigPgns()
+    {
+        if (!_isEnabled) return; // raced past Stop()
+        try
+        {
+            var cfg = ConfigurationStore.Instance.AutoSteer;
+            _udpService.SendToModules(PgnBuilder.BuildSteerConfigPgn(cfg));
+            _udpService.SendToModules(PgnBuilder.BuildSteerSettingsPgn(cfg));
+        }
+        catch (Exception ex)
+        {
+            // Don't let an emit failure tear down the timer / service.
+            Debug.WriteLine($"[AutoSteerService] PGN emit failed: {ex.Message}");
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -170,6 +266,17 @@ public class AutoSteerService : IAutoSteerService
         if (!PgnBuilder.TryParseSteerData(data, out var steerData))
             return;
 
+        // Track whether anything UI-relevant changed so we only burn a
+        // snapshot allocation + handler dispatch when there's news.
+        // The motor calibration wizard's physical-switch gate is the
+        // motivating case: without firing StateUpdated here, the gate
+        // would only re-evaluate on the next GPS packet, leaving the
+        // operator waiting for several ticks after flipping the switch.
+        bool switchChanged =
+            _lastSteerData.SteerSwitchActive != steerData.SteerSwitchActive ||
+            _lastSteerData.WorkSwitchActive != steerData.WorkSwitchActive ||
+            _lastSteerData.RemoteButtonPressed != steerData.RemoteButtonPressed;
+
         _lastSteerData = steerData;
 
         // Update vehicle state with actual angle from WAS
@@ -178,6 +285,19 @@ public class AutoSteerService : IAutoSteerService
         _state.WorkSwitchActive = steerData.WorkSwitchActive;
 
         _smartWas?.AddSample(steerData.ActualSteerAngle);
+
+        if (switchChanged)
+        {
+            Debug.WriteLine(
+                $"[AutoSteer] PGN 253 switch change: SteerSwitchActive={steerData.SteerSwitchActive} " +
+                $"WorkSwitchActive={steerData.WorkSwitchActive} " +
+                $"Remote={steerData.RemoteButtonPressed} Pwm={steerData.PwmDisplay}");
+
+            // Fire the standard cycle event so UI subscribers (wizard gates,
+            // config dialog indicators, chart series) see the new switch
+            // state without waiting for the next GPS packet.
+            NotifyStateUpdated();
+        }
     }
 
     /// <summary>
@@ -279,7 +399,7 @@ public class AutoSteerService : IAutoSteerService
         _udpService.SendToModules(pgn);
     }
 
-    public void SetMachineState(ushort sectionBits, bool isInUTurn, byte hydLiftState = 0)
+    public void SetMachineState(ulong sectionBits, bool isInUTurn, byte hydLiftState = 0)
     {
         _state.SectionStates = sectionBits;
         _state.IsInUTurn = isInUTurn;
@@ -318,19 +438,37 @@ public class AutoSteerService : IAutoSteerService
     {
         if (!_isEnabled) return;
 
-        // Parse directly into VehicleState (zero-copy). ParseIntoState marks
-        // its own parse-timing fields; no BeginNewCycle here because the
-        // cycle owns timing now.
-        ReadOnlySpan<byte> data = buffer.AsSpan(0, length);
-        if (!NmeaParserServiceFast.ParseIntoState(data, ref _state))
+        // PERF-05 #7 (autosteer-RX). Cycle = one GPS buffer parsed.
+        // Marker .perf_autosteer shared with TX. Emits [AutoSteerRx-PERF].
+        bool perf = AgValoniaGPS.Models.Diagnostics.DiagFlags.PerfAutoSteer;
+        long perfT0 = perf ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        long perfA0 = perf ? GC.GetAllocatedBytesForCurrentThread() : 0;
+        try
         {
-            _parseFailures++;
-            return;
-        }
+            // Parse directly into VehicleState (zero-copy). ParseIntoState marks
+            // its own parse-timing fields; no BeginNewCycle here because the
+            // cycle owns timing now.
+            ReadOnlySpan<byte> data = buffer.AsSpan(0, length);
+            if (!NmeaParserServiceFast.ParseIntoState(data, ref _state))
+            {
+                _parseFailures++;
+                return;
+            }
 
-        // Publish the parsed fix to GpsService. This is the sole event the
-        // cycle worker listens to; everything else runs there.
-        PublishGpsData();
+            // Publish the parsed fix to GpsService. This is the sole event the
+            // cycle worker listens to; everything else runs there.
+            PublishGpsData();
+        }
+        finally
+        {
+            if (perf)
+            {
+                _perfRxTicks += System.Diagnostics.Stopwatch.GetTimestamp() - perfT0;
+                _perfRxAllocs += GC.GetAllocatedBytesForCurrentThread() - perfA0;
+                _perfRxCount++;
+                EmitAutoSteerRxIfWindowElapsed();
+            }
+        }
     }
 
     /// <summary>
@@ -371,10 +509,10 @@ public class AutoSteerService : IAutoSteerService
         // Detect tram line wheel positions for PGN 239
         UpdateTramState();
 
-        // Build and send PGNs
-        SendPgns();
-
-        // Mark PGN sent and record latency
+        // PGN sends now happen on the host control loop (#313 commit 4 of 11)
+        // at 100 Hz, matching the firmware autosteer task cadence. State mutation
+        // here still happens at GPS rate; the loop reads the latest state on
+        // each tick.
         _state.MarkPgnSent();
         RecordLatency(_state.TotalLatencyMs);
 
@@ -424,9 +562,14 @@ public class AutoSteerService : IAutoSteerService
         if (_tramLineService != null && _tramLineService.HasTramLines &&
             ConfigurationStore.Instance.Tram.DisplayMode != Models.Configuration.TramDisplayMode.Off)
         {
-            // Use approximate tool position so detection matches implement indicators
+            // Use approximate tool position so detection matches implement indicators.
+            // Rigid tools sit at Tool.HitchLength (working center); trailing/TBT project
+            // from Vehicle.HitchLength (tractor hitch pin) plus the trailing arm.
             var config = ConfigurationStore.Instance;
-            double hitchLen = config.Tool.HitchLength + config.Tool.TrailingHitchLength;
+            double hitchBase = (config.Tool.IsToolFrontFixed || config.Tool.IsToolRearFixed)
+                ? config.Tool.HitchLength
+                : config.Vehicle.HitchLength;
+            double hitchLen = hitchBase + config.Tool.TrailingHitchLength;
             double toolE = _state.Easting + Math.Sin(_state.HeadingRadians) * hitchLen;
             double toolN = _state.Northing + Math.Cos(_state.HeadingRadians) * hitchLen;
 
@@ -475,6 +618,86 @@ public class AutoSteerService : IAutoSteerService
             tram: _state.TramState,
             geoStop: _state.GeoStopState);
         _udpService.SendToModules(machinePgn);
+
+        // Send PGN 229 (64-section on/off) alongside PGN 239 only when more
+        // than 16 sections are configured. PGN 239 still carries sections 1–16;
+        // the firmware reconciles the overlap. Below 17 sections, 239 is
+        // sufficient and 229 is skipped to keep the bus quiet.
+        if (ConfigurationStore.Instance.NumSections > 16)
+        {
+            var sections64Pgn = PgnBuilder.BuildSection64Pgn(ref _state);
+            _udpService.SendToModules(sections64Pgn);
+        }
+    }
+
+    /// <summary>
+    /// Build and send PGN 254 + PGN 239 from the current vehicle state.
+    /// Called by the host control loop (#313) on every tick (100 Hz) so the
+    /// firmware autosteer task — which also runs at 100 Hz — sees a fresh
+    /// PGN every cycle. Reads <c>_state</c> without locking; concurrent
+    /// updates from the GPS pipeline thread may produce a torn read on
+    /// individual fields, which the firmware tolerates by acting on
+    /// whatever bits it has at its next loop iteration.
+    /// </summary>
+    public void SendPgnsForControlTick()
+    {
+        if (!_isEnabled) return;
+        // PERF-05 #7 (autosteer-TX). Cycle = one PGN-send tick (outbound
+        // steering / config / hello). Emits [AutoSteerTx-PERF].
+        bool perf = AgValoniaGPS.Models.Diagnostics.DiagFlags.PerfAutoSteer;
+        long perfT0 = perf ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        long perfA0 = perf ? GC.GetAllocatedBytesForCurrentThread() : 0;
+        try { SendPgns(); }
+        finally
+        {
+            if (perf)
+            {
+                _perfTxTicks += System.Diagnostics.Stopwatch.GetTimestamp() - perfT0;
+                _perfTxAllocs += GC.GetAllocatedBytesForCurrentThread() - perfA0;
+                _perfTxCount++;
+                EmitAutoSteerTxIfWindowElapsed();
+            }
+        }
+    }
+
+    // PERF-05 #7 accumulators (gated by DiagFlags.PerfAutoSteer).
+    private long _perfRxTicks, _perfRxAllocs;
+    private int _perfRxCount;
+    private DateTime _perfRxWindowStart = DateTime.UtcNow;
+    private long _perfTxTicks, _perfTxAllocs;
+    private int _perfTxCount;
+    private DateTime _perfTxWindowStart = DateTime.UtcNow;
+
+    private void EmitAutoSteerRxIfWindowElapsed()
+    {
+        var elapsed = (DateTime.UtcNow - _perfRxWindowStart).TotalSeconds;
+        if (elapsed < 1.0 || _perfRxCount == 0) return;
+        double ticksPerUs = System.Diagnostics.Stopwatch.Frequency / 1_000_000.0;
+        Console.WriteLine(
+            $"[AutoSteerRx-PERF] cycles={_perfRxCount}"
+            + $" us/cycle={(_perfRxTicks / ticksPerUs / _perfRxCount):F1}"
+            + $" alloc/cycle={(_perfRxAllocs / _perfRxCount)}B"
+            + $" total_us={(long)(_perfRxTicks / ticksPerUs)}"
+            + $" total_alloc={_perfRxAllocs}B"
+            + $" window={elapsed:F2}s");
+        _perfRxTicks = 0; _perfRxAllocs = 0; _perfRxCount = 0;
+        _perfRxWindowStart = DateTime.UtcNow;
+    }
+
+    private void EmitAutoSteerTxIfWindowElapsed()
+    {
+        var elapsed = (DateTime.UtcNow - _perfTxWindowStart).TotalSeconds;
+        if (elapsed < 1.0 || _perfTxCount == 0) return;
+        double ticksPerUs = System.Diagnostics.Stopwatch.Frequency / 1_000_000.0;
+        Console.WriteLine(
+            $"[AutoSteerTx-PERF] cycles={_perfTxCount}"
+            + $" us/cycle={(_perfTxTicks / ticksPerUs / _perfTxCount):F1}"
+            + $" alloc/cycle={(_perfTxAllocs / _perfTxCount)}B"
+            + $" total_us={(long)(_perfTxTicks / ticksPerUs)}"
+            + $" total_alloc={_perfTxAllocs}B"
+            + $" window={elapsed:F2}s");
+        _perfTxTicks = 0; _perfTxAllocs = 0; _perfTxCount = 0;
+        _perfTxWindowStart = DateTime.UtcNow;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

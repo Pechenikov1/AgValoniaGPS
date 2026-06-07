@@ -41,7 +41,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
     </UserControl.Styles>
     <controls:FloatingPanel x:Name="FP"
                             Title="{loc:Localize ApplicationSettings}"
-                            CloseCommand="{Binding ToggleFileMenuPanelCommand}">
+                            CloseCommand="{Binding CloseAllNavFlyoutsCommand}">
         <controls:FloatingPanel.PanelContent>
             <StackPanel Spacing="4">
 
@@ -52,17 +52,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
                 <Separator Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="0,4"/>
 
                 <!-- App Configuration -->
+                <Button Classes="MenuListButton" Content="App Settings"                    HorizontalAlignment="Stretch" Margin="0,2" ClickMode="Press" Command="{Binding ShowAppSettingsDialogCommand}"/>
                 <Button Classes="MenuListButton" Content="{loc:Localize ViewAllSettings}"  HorizontalAlignment="Stretch" Margin="0,2" ClickMode="Press" Command="{Binding ShowViewSettingsDialogCommand}"/>
-                <Button Classes="MenuListButton" Content="{loc:Localize AppDirectories}"   HorizontalAlignment="Stretch" Margin="0,2" ClickMode="Press" Command="{Binding ShowAppDirectoriesDialogCommand}"/>
                 <Button Classes="MenuListButton" Content="{loc:Localize LogViewer}"        HorizontalAlignment="Stretch" Margin="0,2" ClickMode="Press" Command="{Binding ShowLogViewerDialogCommand}"/>
                 <Button Classes="MenuListButton" Content="{loc:Localize Hotkeys}"          HorizontalAlignment="Stretch" Margin="0,2" ClickMode="Press" Command="{Binding ShowHotkeyConfigDialogCommand}"/>
 
                 <Separator Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="0,4"/>
 
-                <!-- NTRIP Profiles -->
-                <Button Classes="MenuListButton" Content="{loc:Localize NtripProfiles}"    HorizontalAlignment="Stretch" Margin="0,2" ClickMode="Press" Command="{Binding ShowNtripProfilesDialogCommand}"/>
-
-                <Separator Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="0,4"/>
+                <!-- NTRIP moved to the Network IO panel (left-nav). -->
 
                 <!-- Simulator -->
                 <Button Classes="MenuListButton" Content="{loc:Localize Simulator}"        HorizontalAlignment="Stretch" Margin="0,2" ClickMode="Press" Command="{Binding ToggleSimulatorPanelCommand}"/>
@@ -70,7 +67,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
                 <Separator Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="0,4"/>
 
                 <!-- Help & Info -->
-                <Button Classes="MenuListButton" Content="{loc:Localize AgShareApi}"       HorizontalAlignment="Stretch" Margin="0,2" ClickMode="Press" Command="{Binding ShowAgShareSettingsDialogCommand}"/>
                 <Button Classes="MenuListButton" Content="{loc:Localize Help}"             HorizontalAlignment="Stretch" Margin="0,2" ClickMode="Press" Command="{Binding ShowHelpDialogCommand}"/>
                 <Button Classes="MenuListButton" Content="{loc:Localize About}"            HorizontalAlignment="Stretch" Margin="0,2" ClickMode="Press" Command="{Binding ShowAboutDialogCommand}"/>
                 <Button Classes="MenuListButton" Content="{loc:Localize BugReportDump}"    HorizontalAlignment="Stretch" Margin="0,2" ClickMode="Press" Command="{Binding ShowBugReportDialogCommand}"/>

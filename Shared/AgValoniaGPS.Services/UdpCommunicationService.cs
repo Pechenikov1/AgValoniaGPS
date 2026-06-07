@@ -23,6 +23,7 @@ using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using AgValoniaGPS.Models;
+using AgValoniaGPS.Services.AutoSteer;
 using AgValoniaGPS.Services.Interfaces;
 
 namespace AgValoniaGPS.Services;
@@ -73,10 +74,13 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
     private DateTime _lastDataFromIMU = DateTime.MinValue;
 
     // Per-module remote IP from the most recent inbound packet. Populated from
-    // HELLO_FROM_* (and AutoSteer data PGNs, which also identify the module).
+    // HELLO_FROM_* (and AutoSteer data PGNs, which also identify the module), and
+    // authoritatively from a PGN 203 scan reply (which also carries GPS + subnet).
     private string? _autoSteerIp;
     private string? _machineIp;
     private string? _imuIp;
+    private string? _gpsIp;
+    private string? _moduleSubnet;
 
     private const int HELLO_TIMEOUT_MS = 2000; // 2 seconds for hello response
     private const int DATA_TIMEOUT_STEER_MACHINE_MS = 100; // 50Hz data = 20ms cycle, allow 100ms
@@ -161,6 +165,13 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
     {
         if (!IsConnected || _udpSocket == null) return;
 
+        // PERF-05 #6 (UDP TX). Cycle = one SendToModules invocation that
+        // passed the connected check. Marker .perf_udp shared with RX path;
+        // emit line is [UdpTx-PERF].
+        bool perf = AgValoniaGPS.Models.Diagnostics.DiagFlags.PerfUdp;
+        long perfT0 = perf ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        long perfA0 = perf ? GC.GetAllocatedBytesForCurrentThread() : 0;
+
         // Refresh discovery endpoints periodically
         if ((DateTime.UtcNow - _lastDiscoveryRefresh).TotalSeconds > DiscoveryRefreshSeconds)
         {
@@ -187,14 +198,29 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
             foreach (var ep in _discoveryEndpoints)
                 SendPacket(data, ep);
         }
+
+        if (perf)
+        {
+            _perfTxTicks += System.Diagnostics.Stopwatch.GetTimestamp() - perfT0;
+            _perfTxAllocs += GC.GetAllocatedBytesForCurrentThread() - perfA0;
+            _perfTxCount++;
+            EmitTxIfWindowElapsed();
+        }
     }
 
     private void SendPacket(byte[] data, IPEndPoint endpoint)
     {
         try
         {
-            _udpSocket!.BeginSendTo(data, 0, data.Length, SocketFlags.None, endpoint,
-                ar => { try { _udpSocket?.EndSendTo(ar); } catch { } }, null);
+            // Synchronous SendTo is zero-alloc; the legacy BeginSendTo APM
+            // pattern allocated an IAsyncResult + overlapped state + the
+            // completion-callback closure per call. With ~15 broadcast
+            // endpoints in discovery mode and 2 PGNs/cycle at 100 Hz, that
+            // adds up to ~5 MB/s of LOH churn — sustained allocation pressure
+            // that eventually triggers a Gen2 collection and produces a
+            // 1-3 s UI thread freeze. UDP sends to a local socket are
+            // microseconds; the kernel queues immediately.
+            _udpSocket!.SendTo(data, endpoint);
         }
         catch { }
     }
@@ -308,48 +334,144 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
 
     private void ProcessReceivedData(byte[] data, IPEndPoint remoteEndPoint)
     {
-        // Check if this is a binary PGN message or text NMEA sentence
-        if (data.Length >= 2 && data[0] == PgnMessage.HEADER1 && data[1] == PgnMessage.HEADER2)
+        // PERF-05 #6 (UDP RX). Cycle = one inbound packet processed.
+        // Captures DataReceived subscriber cost (NMEA parse, GpsData alloc,
+        // PGN handler dispatch). Marker .perf_udp shared with TX.
+        bool perf = AgValoniaGPS.Models.Diagnostics.DiagFlags.PerfUdp;
+        long perfT0 = perf ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        long perfA0 = perf ? GC.GetAllocatedBytesForCurrentThread() : 0;
+        try
         {
-            // Binary PGN message
-            if (data.Length < 6) return;
-
-            byte pgn = data[3];
-
-            // Track module connections based on hello messages
-            UpdateModuleConnection(pgn, remoteEndPoint);
-
-            // Fire event
-            DataReceived?.Invoke(this, new UdpDataReceivedEventArgs
+            // Check if this is a binary PGN message or text NMEA sentence
+            if (data.Length >= 2 && data[0] == PgnMessage.HEADER1 && data[1] == PgnMessage.HEADER2)
             {
-                Data = data,
-                RemoteEndPoint = remoteEndPoint,
-                PGN = pgn,
-                Timestamp = DateTime.Now
-            });
+                // Binary PGN message
+                if (data.Length < 6) return;
+
+                byte pgn = data[3];
+
+                // Track module connections based on hello messages
+                UpdateModuleConnection(data, remoteEndPoint);
+
+                // Fire event
+                DataReceived?.Invoke(this, new UdpDataReceivedEventArgs
+                {
+                    Data = data,
+                    RemoteEndPoint = remoteEndPoint,
+                    PGN = pgn,
+                    Timestamp = DateTime.Now
+                });
+            }
+            else if (data.Length > 0 && data[0] == (byte)'$')
+            {
+                // Text NMEA sentence (starts with $)
+                // Fire event with PGN 0 to indicate NMEA text
+                DataReceived?.Invoke(this, new UdpDataReceivedEventArgs
+                {
+                    Data = data,
+                    RemoteEndPoint = remoteEndPoint,
+                    PGN = 0, // Special PGN for NMEA text
+                    Timestamp = DateTime.Now
+                });
+            }
         }
-        else if (data.Length > 0 && data[0] == (byte)'$')
+        finally
         {
-            // Text NMEA sentence (starts with $)
-            // Fire event with PGN 0 to indicate NMEA text
-            DataReceived?.Invoke(this, new UdpDataReceivedEventArgs
+            if (perf)
             {
-                Data = data,
-                RemoteEndPoint = remoteEndPoint,
-                PGN = 0, // Special PGN for NMEA text
-                Timestamp = DateTime.Now
-            });
+                _perfRxTicks += System.Diagnostics.Stopwatch.GetTimestamp() - perfT0;
+                _perfRxAllocs += GC.GetAllocatedBytesForCurrentThread() - perfA0;
+                _perfRxCount++;
+                EmitRxIfWindowElapsed();
+            }
         }
     }
 
-    private void UpdateModuleConnection(byte pgn, IPEndPoint remoteEndPoint)
+    // PERF-05 #6 accumulators (gated by DiagFlags.PerfUdp). RX runs on the
+    // socket receive thread; TX runs on whichever thread fires SendToModules
+    // (autosteer pipeline / UI). No lock — last writer wins on the counters
+    // is acceptable for diagnostic data.
+    private long _perfRxTicks, _perfRxAllocs;
+    private int _perfRxCount;
+    private DateTime _perfRxWindowStart = DateTime.UtcNow;
+    private long _perfTxTicks, _perfTxAllocs;
+    private int _perfTxCount;
+    private DateTime _perfTxWindowStart = DateTime.UtcNow;
+
+    private void EmitRxIfWindowElapsed()
+    {
+        // #412: Snapshot the accumulators first so a concurrent caller can't
+        // reset _perfRxCount to 0 between our guard check and the integer
+        // division below (which would throw DivideByZeroException).
+        int count = _perfRxCount;
+        long ticks = _perfRxTicks;
+        long allocs = _perfRxAllocs;
+        var elapsed = (DateTime.UtcNow - _perfRxWindowStart).TotalSeconds;
+        if (elapsed < 1.0 || count == 0) return;
+        double ticksPerUs = System.Diagnostics.Stopwatch.Frequency / 1_000_000.0;
+        Console.WriteLine(
+            $"[UdpRx-PERF] packets={count}"
+            + $" us/packet={(ticks / ticksPerUs / count):F1}"
+            + $" alloc/packet={(allocs / count)}B"
+            + $" total_us={(long)(ticks / ticksPerUs)}"
+            + $" total_alloc={allocs}B"
+            + $" window={elapsed:F2}s");
+        _perfRxTicks = 0;
+        _perfRxAllocs = 0;
+        _perfRxCount = 0;
+        _perfRxWindowStart = DateTime.UtcNow;
+    }
+
+    private void EmitTxIfWindowElapsed()
+    {
+        // #412: Snapshot the accumulators first so a concurrent caller can't
+        // reset _perfTxCount to 0 between our guard check and the integer
+        // division below (which would throw DivideByZeroException).
+        int count = _perfTxCount;
+        long ticks = _perfTxTicks;
+        long allocs = _perfTxAllocs;
+        var elapsed = (DateTime.UtcNow - _perfTxWindowStart).TotalSeconds;
+        if (elapsed < 1.0 || count == 0) return;
+        double ticksPerUs = System.Diagnostics.Stopwatch.Frequency / 1_000_000.0;
+        Console.WriteLine(
+            $"[UdpTx-PERF] sends={count}"
+            + $" us/send={(ticks / ticksPerUs / count):F1}"
+            + $" alloc/send={(allocs / count)}B"
+            + $" total_us={(long)(ticks / ticksPerUs)}"
+            + $" total_alloc={allocs}B"
+            + $" window={elapsed:F2}s");
+        _perfTxTicks = 0;
+        _perfTxAllocs = 0;
+        _perfTxCount = 0;
+        _perfTxWindowStart = DateTime.UtcNow;
+    }
+
+    private void UpdateModuleConnection(byte[] data, IPEndPoint remoteEndPoint)
     {
         var now = DateTime.Now;
         var remoteIp = remoteEndPoint.Address.ToString();
+        byte pgn = data[3];
 
         // Track ALL PGNs as data - if we're getting any PGN from a module, it's sending data
         switch (pgn)
         {
+            // Scan reply: the module self-reports its full IP + subnet (and is the
+            // only inbound PGN that carries the GPS module's IP).
+            case PgnNumbers.SCAN_REPLY: // 203
+                if (PgnBuilder.TryParseScanReply(data, out byte moduleId, out string scanIp, out string scanSubnet))
+                {
+                    _moduleSubnet = scanSubnet;
+                    switch (moduleId)
+                    {
+                        case 126: _autoSteerIp = scanIp; break;
+                        case 123: _machineIp = scanIp; break;
+                        case 121: _imuIp = scanIp; break;
+                        case 120: _gpsIp = scanIp; break;
+                    }
+                    _lastModuleResponse = DateTime.UtcNow;
+                }
+                break;
+
             // AutoSteer PGNs
             case PgnNumbers.HELLO_FROM_AUTOSTEER: // 126
                 _lastHelloFromAutoSteer = now;
@@ -400,8 +522,94 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
         ModuleType.AutoSteer => _autoSteerIp,
         ModuleType.Machine   => _machineIp,
         ModuleType.IMU       => _imuIp,
+        ModuleType.GPS       => _gpsIp,
         _                    => null,
     };
+
+    /// <summary>
+    /// The /24 subnet (first three octets) most recently reported by a module in
+    /// a PGN 203 scan reply, or null if no scan reply has been seen.
+    /// </summary>
+    public string? GetModuleSubnet() => _moduleSubnet;
+
+    /// <summary>
+    /// Broadcast a scan request (PGN 202). Modules reply with PGN 203 (parsed in
+    /// <see cref="UpdateModuleConnection"/> into per-module IP + subnet).
+    /// </summary>
+    public void ScanModules() => SendModuleConfig(PgnBuilder.BuildScanRequest());
+
+    /// <summary>
+    /// Broadcast a set-subnet command (PGN 201, global /24 change), then re-arm
+    /// discovery so the next module hellos re-lock the new subnet.
+    /// </summary>
+    public void SetModuleSubnet(byte octet1, byte octet2, byte octet3)
+    {
+        SendModuleConfig(PgnBuilder.BuildSubnetChange(octet1, octet2, octet3));
+        ResetDiscovery();
+    }
+
+    /// <summary>
+    /// Send a module-config packet (scan request 202 / set-subnet 201) to the
+    /// GLOBAL broadcast 255.255.255.255:8888, once per up IPv4 NIC — matching
+    /// AgIO's FormUDP behaviour. Global (not directed subnet.255) broadcast is
+    /// deliberate so the packet reaches modules that are currently on a different
+    /// or unknown subnet. Also hits localhost for the simulator/ModSim.
+    /// </summary>
+    private void SendModuleConfig(byte[] data)
+    {
+        if (!IsConnected) return;
+
+        // Simulator / ModSim listens on loopback.
+        try { _udpSocket?.SendTo(data, _localhostEndpoint); } catch { }
+
+        var dest = new IPEndPoint(IPAddress.Broadcast, 8888);
+        try
+        {
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != OperationalStatus.Up) continue;
+                if (!nic.Supports(NetworkInterfaceComponent.IPv4)) continue;
+
+                foreach (var addr in nic.GetIPProperties().UnicastAddresses)
+                {
+                    if (addr.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                    if (IPAddress.IsLoopback(addr.Address)) continue;
+
+                    try
+                    {
+                        // Bind a transient socket to this NIC so the broadcast
+                        // actually egresses it (multi-homed tablets), exactly as
+                        // AgIO does. ReuseAddress lets us co-bind :9999 with the
+                        // main receive socket; replies still arrive on it.
+                        using var s = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                        s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Broadcast, true);
+                        s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                        s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.DontRoute, true);
+                        s.Bind(new IPEndPoint(addr.Address, 9999));
+                        s.SendTo(data, dest);
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[UDP] SendModuleConfig failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Drop the locked send endpoint and refresh discovery so the next module
+    /// hellos re-lock the (possibly new) subnet. Call right after a subnet change
+    /// so the app follows the modules to their new /24 instead of waiting out the
+    /// module-timeout.
+    /// </summary>
+    private void ResetDiscovery()
+    {
+        _lockedEndpoint = null;
+        _discoveryEndpoints = GetBroadcastEndpoints();
+        _lastDiscoveryRefresh = DateTime.UtcNow;
+    }
 
     /// <summary>
     /// Lock outgoing packets to the subnet of a responding module.
@@ -479,6 +687,34 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
         catch { }
 
         return null;
+    }
+
+    /// <summary>
+    /// All non-loopback IPv4 addresses of the host's up network interfaces.
+    /// Lets the operator see which subnet the host is on so they can match the
+    /// modules' subnet.
+    /// </summary>
+    public IReadOnlyList<string> GetLocalIpAddresses()
+    {
+        var list = new List<string>();
+        try
+        {
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != OperationalStatus.Up) continue;
+                if (!nic.Supports(NetworkInterfaceComponent.IPv4)) continue;
+
+                foreach (var addr in nic.GetIPProperties().UnicastAddresses)
+                {
+                    if (addr.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                    if (IPAddress.IsLoopback(addr.Address)) continue;
+                    var s = addr.Address.ToString();
+                    if (!list.Contains(s)) list.Add(s);
+                }
+            }
+        }
+        catch { }
+        return list;
     }
 
     public void Dispose()

@@ -24,6 +24,13 @@ namespace AgValoniaGPS.Models.Configuration;
 /// </summary>
 public class ToolConfig : ObservableObject
 {
+    /// <summary>
+    /// Maximum number of sections supported across the app. Section on/off
+    /// for sections 1–16 ships in PGN 239/254; sections 17–64 ship in the
+    /// 64-section PGN 229 (sent only when more than 16 sections are configured).
+    /// </summary>
+    public const int MaxSections = 64;
+
     // Tool dimensions
     private double _width = 6.0;
     public double Width
@@ -52,7 +59,10 @@ public class ToolConfig : ObservableObject
         set => SetProperty(ref _offset, value);
     }
 
-    // Hitch configuration
+    // Hitch (rigid tool): axle center -> implement working center (e.g. tiller rotary
+    // shaft, disc shaft). Tool-dependent, so it lives with the tool. Used ONLY by
+    // front/rear-fixed rigid tools. Trailing/TBT tools instead use Vehicle.HitchLength
+    // for the tractor hitch pin. Front tools use this positive (ahead), rear negative.
     private double _hitchLength = 1.8;
     public double HitchLength
     {
@@ -85,6 +95,16 @@ public class ToolConfig : ObservableObject
         set => SetProperty(ref _trailingToolToPivotLength, value);
     }
 
+    // ISO 11783 hitch/coupling type code (-1 = not available, 0 = unknown/default,
+    // 1..10 = specific ISO coupling standards). Stored as the ISO integer; the UI
+    // shows the text description. Informational metadata for now (export/PGN).
+    private int _hitchType;
+    public int HitchType
+    {
+        get => _hitchType;
+        set => SetProperty(ref _hitchType, value);
+    }
+
     // Tool type flags
     private bool _isToolTrailing;
     public bool IsToolTrailing
@@ -114,15 +134,19 @@ public class ToolConfig : ObservableObject
         set => SetProperty(ref _isToolFrontFixed, value);
     }
 
-    // Section lookahead settings
-    private double _lookAheadOnSetting = 1.0;
+    // Section lookahead settings — default to 0 (no anticipation, no wait).
+    // Non-zero values model an actuator open/close delay; with the SectionControlService
+    // implementation the projection cancels the phase delay so the spray edge lands on
+    // the boundary, but only if the user actually has a slow valve. Defaulting to 0
+    // means a freshly-created vehicle paints right up to coverage edges (#332/#339).
+    private double _lookAheadOnSetting = 0.0;
     public double LookAheadOnSetting
     {
         get => _lookAheadOnSetting;
         set => SetProperty(ref _lookAheadOnSetting, value);
     }
 
-    private double _lookAheadOffSetting = 0.5;
+    private double _lookAheadOffSetting = 0.0;
     public double LookAheadOffSetting
     {
         get => _lookAheadOffSetting;
@@ -152,8 +176,9 @@ public class ToolConfig : ObservableObject
     }
 
     // Section colors (RGB values stored as 0xRRGGBB)
-    // Default colors match AgOpenGPS preset palette
-    private uint[] _sectionColors = new uint[16]
+    // Default colors match AgOpenGPS preset palette (16 hues, cycled across all
+    // MaxSections so sections 17–64 also get a sensible default color).
+    private static readonly uint[] DefaultSectionPalette =
     {
         0x00FF00, // Green
         0xFF0000, // Red
@@ -173,6 +198,16 @@ public class ToolConfig : ObservableObject
         0xFF80FF  // Light Magenta
     };
 
+    private uint[] _sectionColors = CreateDefaultSectionColors();
+
+    private static uint[] CreateDefaultSectionColors()
+    {
+        var colors = new uint[MaxSections];
+        for (int i = 0; i < MaxSections; i++)
+            colors[i] = DefaultSectionPalette[i % DefaultSectionPalette.Length];
+        return colors;
+    }
+
     /// <summary>
     /// Section colors as RGB values (0xRRGGBB format).
     /// </summary>
@@ -187,7 +222,7 @@ public class ToolConfig : ObservableObject
     /// </summary>
     public uint GetSectionColor(int index)
     {
-        if (index < 0 || index >= 16) return _sectionColors[0];
+        if (index < 0 || index >= MaxSections) return _sectionColors[0];
         return _sectionColors[index];
     }
 
@@ -196,7 +231,7 @@ public class ToolConfig : ObservableObject
     /// </summary>
     public void SetSectionColor(int index, uint color)
     {
-        if (index < 0 || index >= 16) return;
+        if (index < 0 || index >= MaxSections) return;
         _sectionColors[index] = color;
         OnPropertyChanged(nameof(SectionColors));
     }
@@ -270,12 +305,19 @@ public class ToolConfig : ObservableObject
     /// </summary>
     public double CoverageMarginMeters => _coverageMargin / 100.0;
 
-    // Individual section widths (cm) - up to 16 sections
-    private double[] _sectionWidths = new double[16] { 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100 };
+    // Individual section widths (cm) - up to MaxSections sections
+    private double[] _sectionWidths = CreateDefaultSectionWidths();
+
+    private static double[] CreateDefaultSectionWidths()
+    {
+        var widths = new double[MaxSections];
+        for (int i = 0; i < MaxSections; i++) widths[i] = 100;
+        return widths;
+    }
 
     /// <summary>
     /// Gets or sets individual section widths in centimeters.
-    /// Array of 16 values, one per section.
+    /// Array of MaxSections values, one per section.
     /// </summary>
     public double[] SectionWidths
     {
@@ -284,11 +326,11 @@ public class ToolConfig : ObservableObject
     }
 
     /// <summary>
-    /// Gets or sets a specific section width by index (0-15).
+    /// Gets or sets a specific section width by index (0..MaxSections-1).
     /// </summary>
     public double GetSectionWidth(int index)
     {
-        if (index < 0 || index >= 16) return DefaultSectionWidth;
+        if (index < 0 || index >= MaxSections) return DefaultSectionWidth;
         return _sectionWidths[index];
     }
 
@@ -297,7 +339,7 @@ public class ToolConfig : ObservableObject
     /// </summary>
     public void SetSectionWidth(int index, double value)
     {
-        if (index < 0 || index >= 16) return;
+        if (index < 0 || index >= MaxSections) return;
         _sectionWidths[index] = value;
         OnPropertyChanged(nameof(SectionWidths));
         OnPropertyChanged(nameof(TotalSectionWidth));
@@ -313,7 +355,7 @@ public class ToolConfig : ObservableObject
             double total = 0;
             // NumSections is in ConfigurationStore, so we use a simpler approach here
             // This will be calculated properly in the ViewModel
-            for (int i = 0; i < 16; i++)
+            for (int i = 0; i < MaxSections; i++)
                 total += _sectionWidths[i];
             return total / 100.0; // Convert cm to meters
         }

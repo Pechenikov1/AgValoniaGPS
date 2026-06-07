@@ -83,11 +83,19 @@ public class VehicleProfileService : IVehicleProfileService
     {
         try
         {
-            // Prefer JSON format - loads directly into store
-            if (ProfileJsonService.Load(VehiclesDirectory, profileName, store))
+            // Prefer v2 vehicle-only format (#346) — JSON with FormatVersion >= 2.
+            if (VehicleProfileJsonService.Load(VehiclesDirectory, profileName, store))
                 return true;
 
-            // Fall back to legacy XML - parse and populate store directly
+            // Fall back to v1 combined JSON. V1 hydrates the entire store
+            // (Vehicle + Guidance + YouTurn + General + Tool + Sections); the
+            // Tool side will be re-written to its own file on next save, and
+            // the v1 → v2 migration in ConfigurationService handles the
+            // proactive split for users who don't save first.
+            if (ProfileJsonServiceV1.Load(VehiclesDirectory, profileName, store))
+                return true;
+
+            // Last-resort fall back to legacy AOG XML.
             var filePath = ResolveExistingFile(profileName, ".xml");
             if (filePath == null)
                 return false;
@@ -161,8 +169,41 @@ public class VehicleProfileService : IVehicleProfileService
 
     public void Save(string profileName, ConfigurationStore store)
     {
-        // Save JSON only (new canonical format)
-        ProfileJsonService.Save(VehiclesDirectory, profileName, store);
+        // v2 vehicle-only format (#346). Tool/Sections are persisted via
+        // IToolProfileService — ConfigurationService coordinates both sides.
+        VehicleProfileJsonService.Save(VehiclesDirectory, profileName, store);
+    }
+
+    public bool Rename(string oldName, string newName)
+    {
+        if (string.IsNullOrEmpty(oldName) || string.IsNullOrEmpty(newName))
+            return false;
+
+        var oldPath = Path.Combine(VehiclesDirectory, $"{oldName}.json");
+        var newPath = Path.Combine(VehiclesDirectory, $"{newName}.json");
+        if (!File.Exists(oldPath))
+            return false;
+
+        // Allow case-only rename on case-insensitive filesystems.
+        bool caseOnly = string.Equals(oldName, newName, StringComparison.OrdinalIgnoreCase)
+                      && !string.Equals(oldName, newName, StringComparison.Ordinal);
+        if (!caseOnly && File.Exists(newPath) &&
+            !string.Equals(oldPath, newPath, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        File.Move(oldPath, newPath, overwrite: caseOnly);
+        return true;
+    }
+
+    public bool Delete(string profileName)
+    {
+        if (string.IsNullOrEmpty(profileName))
+            return false;
+        var path = Path.Combine(VehiclesDirectory, $"{profileName}.json");
+        if (!File.Exists(path))
+            return false;
+        File.Delete(path);
+        return true;
     }
 
     public void CreateDefaultProfile(string profileName, ConfigurationStore store)
@@ -175,6 +216,7 @@ public class VehicleProfileService : IVehicleProfileService
         store.Vehicle.AntennaOffset = 0.0;
         store.Vehicle.Wheelbase = 2.5;
         store.Vehicle.TrackWidth = 1.8;
+        store.Vehicle.HitchLength = 1.8;
         store.Vehicle.MaxSteerAngle = 35.0;
         store.Vehicle.MaxAngularVelocity = 35.0;
 
@@ -206,8 +248,8 @@ public class VehicleProfileService : IVehicleProfileService
         store.Tool.IsToolTBT = false;
         store.Tool.IsToolRearFixed = true;
         store.Tool.IsToolFrontFixed = false;
-        store.Tool.LookAheadOnSetting = 1.0;
-        store.Tool.LookAheadOffSetting = 0.5;
+        store.Tool.LookAheadOnSetting = 0.0;
+        store.Tool.LookAheadOffSetting = 0.0;
         store.Tool.TurnOffDelay = 0.0;
         store.Tool.MinCoverage = 100;
         store.Tool.IsMultiColoredSections = false;
@@ -220,10 +262,11 @@ public class VehicleProfileService : IVehicleProfileService
         sectionPositions[1] = 3.0;   // Right edge
         store.SectionPositions = sectionPositions;
 
-        store.IsMetric = false;
+        // IsMetric used to be reset here; it now lives in AppSettings and
+        // is unaffected by creating a new default vehicle profile.
 
-        store.ActiveProfileName = profileName;
-        store.ActiveProfilePath = Path.Combine(VehiclesDirectory, $"{profileName}.json");
+        store.ActiveVehicleProfileName = profileName;
+        store.ActiveVehicleProfilePath = Path.Combine(VehiclesDirectory, $"{profileName}.json");
 
         // Save the new default profile
         Save(profileName, store);
@@ -271,7 +314,12 @@ public class VehicleProfileService : IVehicleProfileService
         store.Tool.Width = GetDouble(settings, "setVehicle_toolWidth", 6.0);
         store.Tool.Overlap = GetDouble(settings, "setVehicle_toolOverlap", 0.0);
         store.Tool.Offset = GetDouble(settings, "setVehicle_toolOffset", 0.0);
-        store.Tool.HitchLength = GetDouble(settings, "setVehicle_hitchLength", 1.8);
+        // AOG's single setVehicle_hitchLength is the tractor hitch pin (now a vehicle
+        // property, used by trailing/TBT) AND doubles as the rigid working-center distance.
+        // Import into both so the value is present whichever tool type the profile uses.
+        double xmlHitch = GetDouble(settings, "setVehicle_hitchLength", 1.8);
+        store.Vehicle.HitchLength = xmlHitch;
+        store.Tool.HitchLength = xmlHitch;
         // Legacy AOG XML profiles often store TrailingHitchLength as a negative value due to
         // a historical sign convention. Migrate to "positive = behind hitch" by taking abs.
         store.Tool.TrailingHitchLength = Math.Abs(GetDouble(settings, "setTool_toolTrailingHitchLength", 2.5));
@@ -299,12 +347,18 @@ public class VehicleProfileService : IVehicleProfileService
         }
         store.SectionPositions = sectionPositions;
 
-        // Display config
-        store.IsMetric = GetBool(settings, "setMenu_isMetric", false);
+        // Display config — IsMetric used to live in the vehicle XML.
+        // It now lives in AppSettings; apply the legacy XML value to the
+        // store so the post-load ReconcileIsMetricAfterProfileLoad can
+        // perform the one-shot migration (the same path the JSON profile
+        // services use). Once migration has completed, AppSettings
+        // overrides the XML value on subsequent loads.
+        if (settings.ContainsKey("setMenu_isMetric"))
+            store.IsMetric = GetBool(settings, "setMenu_isMetric", false);
 
         // Profile metadata
-        store.ActiveProfileName = profileName;
-        store.ActiveProfilePath = filePath;
+        store.ActiveVehicleProfileName = profileName;
+        store.ActiveVehicleProfilePath = filePath;
     }
 
     private Dictionary<string, string> ParseSettings(XDocument doc)

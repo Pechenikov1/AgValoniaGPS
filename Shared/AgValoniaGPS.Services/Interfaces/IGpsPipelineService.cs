@@ -52,6 +52,15 @@ public interface IGpsPipelineService
     void SetYouTurnEnabled(bool enabled);
 
     /// <summary>
+    /// One-shot direction override for the *next* armed automatic U-turn. The
+    /// UI's direction toggle invokes this while idle to pre-flip the upcoming
+    /// turn direction; the cycle's state machine consumes and clears the flag
+    /// on the next turn-creation tick. Pass <c>null</c> to clear an unconsumed
+    /// override.
+    /// </summary>
+    void SetNextUTurnDirectionLeftOverride(bool? leftOverride);
+
+    /// <summary>
     /// Provide the headland polygon for YouTurn zone detection.
     /// </summary>
     void SetHeadlandLine(IReadOnlyList<Vec3>? headlandLine);
@@ -71,6 +80,14 @@ public interface IGpsPipelineService
     /// geometry) so the cycle worker can build its own TickContext.
     /// </summary>
     void SetYouTurnConfig(int uTurnSkipRows, bool isSkipWorkedMode, double headlandCalculatedWidth, double headlandDistance);
+
+    /// <summary>
+    /// Tell the pipeline whether a real field is currently loaded. Used by the
+    /// cycle worker to choose between silently re-anchoring the temporary
+    /// origin (no field) and emitting a far-from-field warning (field loaded)
+    /// when the live GPS position drifts beyond the configured threshold.
+    /// </summary>
+    void SetHasActiveField(bool hasActiveField);
 
     // ── Read-back state the ViewModel needs for commands ─────────────────
 

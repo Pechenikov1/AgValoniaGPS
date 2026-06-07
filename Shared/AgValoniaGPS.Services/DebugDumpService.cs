@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Reflection;
@@ -43,7 +44,7 @@ public class DebugDumpService
         string filePrefix = "debug_dump",
         IReadOnlyList<string>? userAttachments = null)
     {
-        var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
         var dumpDir = outputDirectory
             ?? Path.Combine(Path.GetTempPath(), "AgValoniaGPS", "dumps");
         Directory.CreateDirectory(dumpDir);
@@ -111,6 +112,31 @@ public class DebugDumpService
             AddTextEntry(archive, "gps_data_log_error.txt", ex.ToString());
         }
 
+        // 5c. Last observed YouTurn path — forensic sidecar so we can
+        // replay the exact production omega geometry in a test fixture
+        // when diagnosing drive-over. The recorder retains the most recent
+        // non-null TurnPath; if the operator captured the dump during or
+        // immediately after a U-turn, that path is the offender.
+        try
+        {
+            var lastPath = Logging.GpsDataRecorder.Instance.GetLastTurnPath();
+            if (lastPath != null && lastPath.Count > 0)
+            {
+                var pathDtos = new object[lastPath.Count];
+                for (int i = 0; i < lastPath.Count; i++)
+                {
+                    var p = lastPath[i];
+                    pathDtos[i] = new { e = p.Easting, n = p.Northing, h = p.Heading };
+                }
+                var json = JsonSerializer.Serialize(pathDtos, JsonOptions);
+                AddTextEntry(archive, "turn_path.json", json);
+            }
+        }
+        catch (Exception ex)
+        {
+            AddTextEntry(archive, "turn_path_error.txt", ex.ToString());
+        }
+
         // 6. Current field files (if a field is open)
         try
         {
@@ -140,7 +166,7 @@ public class DebugDumpService
         // 7. Current vehicle profile
         try
         {
-            var profileName = ConfigurationStore.Instance.ActiveProfileName;
+            var profileName = ConfigurationStore.Instance.ActiveVehicleProfileName;
             if (!string.IsNullOrEmpty(profileName))
             {
                 AddTextEntry(archive, "active_profile_name.txt", profileName);
@@ -195,6 +221,72 @@ public class DebugDumpService
         return zipPath;
     }
 
+    /// <summary>
+    /// Append user-supplied notes and attachments to an existing dump zip,
+    /// then move it to its final location with a title-based filename.
+    /// Used by the Bug Report flow so the state-snapshot zip can be created
+    /// the moment the operator presses the Bug Report button (capturing app
+    /// state at the time the bug occurred), and only the user-visible parts
+    /// are appended after they finish typing in the dialog.
+    /// </summary>
+    /// <param name="sourceZipPath">Path to the existing dump zip (typically
+    /// from <see cref="CreateDump"/> with no notes/attachments). Deleted on
+    /// success; left in place if any step throws.</param>
+    /// <param name="outputDirectory">Final destination folder. Created if
+    /// missing.</param>
+    /// <param name="filePrefix">Final file's prefix; the timestamp suffix
+    /// is added here, not taken from the source zip's name.</param>
+    /// <param name="notes">Optional user-typed notes (becomes
+    /// <c>user_notes.txt</c> inside the zip).</param>
+    /// <param name="userAttachments">Optional list of file paths to attach
+    /// under <c>attachments/</c> inside the zip.</param>
+    /// <returns>The final zip path.</returns>
+    public static string FinalizeBugReport(
+        string sourceZipPath,
+        string outputDirectory,
+        string filePrefix,
+        string? notes,
+        IReadOnlyList<string>? userAttachments)
+    {
+        Directory.CreateDirectory(outputDirectory);
+        var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
+        var finalPath = Path.Combine(outputDirectory, $"{filePrefix}_{timestamp}.zip");
+
+        File.Copy(sourceZipPath, finalPath, overwrite: false);
+
+        using (var zipStream = File.Open(finalPath, FileMode.Open, FileAccess.ReadWrite))
+        using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Update))
+        {
+            if (!string.IsNullOrEmpty(notes))
+                AddTextEntry(archive, "user_notes.txt", notes);
+
+            if (userAttachments != null)
+            {
+                foreach (var filePath in userAttachments)
+                {
+                    try
+                    {
+                        if (File.Exists(filePath))
+                        {
+                            var fileName = Path.GetFileName(filePath);
+                            var entry = archive.CreateEntry($"attachments/{fileName}");
+                            using var entryStream = entry.Open();
+                            using var fileStream = File.OpenRead(filePath);
+                            fileStream.CopyTo(entryStream);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        AddTextEntry(archive, $"attachments/{Path.GetFileName(filePath)}_error.txt", ex.ToString());
+                    }
+                }
+            }
+        }
+
+        try { File.Delete(sourceZipPath); } catch { /* best-effort temp cleanup */ }
+        return finalPath;
+    }
+
     private static string BuildSystemInfo()
     {
         var sb = new StringBuilder();
@@ -208,16 +300,20 @@ public class DebugDumpService
             .GetCustomAttribute<System.Reflection.AssemblyFileVersionAttribute>()
             ?.Version ?? "unknown";
 
-        sb.AppendLine($"App Version: {fileVersion}");
-        sb.AppendLine($"Build Info: {infoVersion}");
-        sb.AppendLine($"Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-        sb.AppendLine($"OS: {Environment.OSVersion}");
-        sb.AppendLine($"Runtime: {Environment.Version}");
-        sb.AppendLine($"64-bit OS: {Environment.Is64BitOperatingSystem}");
-        sb.AppendLine($"64-bit Process: {Environment.Is64BitProcess}");
-        sb.AppendLine($"Machine: {Environment.MachineName}");
-        sb.AppendLine($"Processors: {Environment.ProcessorCount}");
-        sb.AppendLine($"Working Set: {Environment.WorkingSet / 1024 / 1024}MB");
+        // Diagnostic dump is consumed by us / shared in bug reports —
+        // pin every interpolation to InvariantCulture so timestamps and
+        // numbers are unambiguous across reporters' locales.
+        var inv = CultureInfo.InvariantCulture;
+        sb.AppendLine(inv, $"App Version: {fileVersion}");
+        sb.AppendLine(inv, $"Build Info: {infoVersion}");
+        sb.AppendLine(inv, $"Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        sb.AppendLine(inv, $"OS: {Environment.OSVersion}");
+        sb.AppendLine(inv, $"Runtime: {Environment.Version}");
+        sb.AppendLine(inv, $"64-bit OS: {Environment.Is64BitOperatingSystem}");
+        sb.AppendLine(inv, $"64-bit Process: {Environment.Is64BitProcess}");
+        sb.AppendLine(inv, $"Machine: {Environment.MachineName}");
+        sb.AppendLine(inv, $"Processors: {Environment.ProcessorCount}");
+        sb.AppendLine(inv, $"Working Set: {Environment.WorkingSet / 1024 / 1024}MB");
         return sb.ToString();
     }
 
@@ -257,7 +353,7 @@ public class DebugDumpService
             },
             NumSections = store.NumSections,
             IsMetric = store.IsMetric,
-            ActiveProfile = store.ActiveProfileName
+            ActiveProfile = store.ActiveVehicleProfileName
         };
         return JsonSerializer.Serialize(snapshot, JsonOptions);
     }
@@ -313,7 +409,8 @@ public class DebugDumpService
         var entries = LogStore.Instance.GetSnapshot();
         foreach (var entry in entries)
         {
-            sb.AppendLine($"[{entry.Timestamp:HH:mm:ss.fff}] [{entry.Level}] {entry.Category}: {entry.Message}");
+            sb.AppendLine(CultureInfo.InvariantCulture,
+                $"[{entry.Timestamp:HH:mm:ss.fff}] [{entry.Level}] {entry.Category}: {entry.Message}");
         }
         return sb.ToString();
     }

@@ -442,7 +442,7 @@ sealed class Program
             config.Display.AutoDayNight = false;
             config.Tool.Width = 6.0;
             vm.State.UI.CloseDialog();
-            if (vm.ConfigurationViewModel != null) vm.ConfigurationViewModel.IsDialogVisible = false;
+            if (vm.ConfigurationViewModel != null) vm.State.UI.CloseDialog();
             await Delay(300);
 
             // Load field
@@ -649,7 +649,7 @@ if frames:
         // Close all dialogs and wait for clean state
         vm.State.UI.CloseDialog();
         if (vm.ConfigurationViewModel != null)
-            vm.ConfigurationViewModel.IsDialogVisible = false;
+            vm.State.UI.CloseDialog();
         await Delay(300);
         Dispatcher.UIThread.RunJobs();
         await Delay(300);
@@ -815,19 +815,19 @@ if frames:
 
         // Step 6: Open configuration dialog
         Console.Write("[Step 6] Configuration dialog... ");
-        vm.ShowConfigurationDialogCommand?.Execute(null);
+        vm.ShowVehicleConfigDialogCommand?.Execute(null);
         await Delay(800);
         CaptureScreenshot(window, "06_configuration");
         // Configuration dialog uses its own visibility mechanism (not State.UI)
         if (vm.ConfigurationViewModel != null)
-            vm.ConfigurationViewModel.IsDialogVisible = false;
+            vm.State.UI.CloseDialog();
         Console.WriteLine("OK");
 
         // Step 6b: Test zoom buttons (#98 fix) -- after all dialogs closed
         Console.Write("[Step 6b] Zoom test... ");
         vm.State.UI.CloseDialog();
         if (vm.ConfigurationViewModel != null)
-            vm.ConfigurationViewModel.IsDialogVisible = false;
+            vm.State.UI.CloseDialog();
         await Delay(500);
         Dispatcher.UIThread.RunJobs();
         CaptureScreenshot(window, "06b_zoom_before");
@@ -1514,8 +1514,8 @@ if frames:
         // Starting at N=-50 and driving 100m to N=50 stays fully within headland
         Console.Write("[Cov 1] Position tractor at (0,-50) heading north... ");
         // Use field origin lat/lon but offset south by ~50m
-        double originLat = settingsService.Settings.SimulatorLatitude;
-        double originLon = settingsService.Settings.SimulatorLongitude;
+        double originLat = AgValoniaGPS.Models.State.PersistentAppState.Instance.SimulatorLatitude;
+        double originLon = AgValoniaGPS.Models.State.PersistentAppState.Instance.SimulatorLongitude;
         // 50m south: ~0.00045 degrees latitude
         vm.SetSimulatorCoordinates(originLat - 0.00045, originLon);
         simService.SetHeading(0); // Face north
@@ -2118,9 +2118,9 @@ if frames:
     static async Task ResetTractorPosition(MainViewModel vm, IGpsSimulationService simService,
         ISettingsService settingsService, double latOffset = 0, double lonOffset = 0)
     {
-        var settings = settingsService.Settings;
-        vm.SetSimulatorCoordinates(settings.SimulatorLatitude + latOffset,
-                                    settings.SimulatorLongitude + lonOffset);
+        var simState = AgValoniaGPS.Models.State.PersistentAppState.Instance;
+        vm.SetSimulatorCoordinates(simState.SimulatorLatitude + latOffset,
+                                    simState.SimulatorLongitude + lonOffset);
         simService.SetHeading(0);
         vm.SimulatorSteerAngle = 0;
         await Delay(50);

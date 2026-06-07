@@ -53,7 +53,8 @@ public static class ServiceCollectionExtensions
         });
 
         // Centralized application state (single source of truth)
-        services.AddSingleton<ApplicationState>();
+        services.AddSingleton<ApplicationState>();           // ephemeral, in-memory only
+        services.AddSingleton(_ => PersistentAppState.Instance); // persisted to appstate.json (same object as .Instance)
 
         // Register ViewModels
         services.AddTransient<MainViewModel>();
@@ -72,6 +73,15 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IFieldService, FieldService>();
         services.AddSingleton<INtripClientService, NtripClientService>();
         services.AddSingleton<ISettingsService, SettingsService>();
+        services.AddSingleton<IPersistentStateService, PersistentStateService>();
+
+        // Per-session jobs (#349). Reads FieldsRoot through ISettingsService
+        // so changes to the user's Documents path are picked up live.
+        services.AddSingleton<IJobService>(sp =>
+        {
+            var settings = sp.GetRequiredService<ISettingsService>();
+            return new JobService(() => settings.Settings.FieldsDirectory);
+        });
 
         // Field file I/O services
         services.AddSingleton<FieldPlaneFileService>();
@@ -104,6 +114,10 @@ public static class ServiceCollectionExtensions
         // Audio service (cross-platform sound effects)
         services.AddSingleton<IAudioService, AgValoniaGPS.iOS.Services.AudioService>();
 
+        // Battery service — UIDevice.BatteryLevel / BatteryState via
+        // NSNotificationCenter (no polling needed).
+        services.AddSingleton<IBatteryService, AgValoniaGPS.iOS.Services.IOSBatteryService>();
+
         // Module communication service (work switch, steer switch logic)
         services.AddSingleton<IModuleCommunicationService, ModuleCommunicationService>();
 
@@ -131,6 +145,7 @@ public static class ServiceCollectionExtensions
 
         // Vehicle profile service
         services.AddSingleton<IVehicleProfileService, VehicleProfileService>();
+        services.AddSingleton<IToolProfileService, ToolProfileService>();
 
         // NTRIP profile service
         services.AddSingleton<INtripProfileService, NtripProfileService>();
@@ -146,6 +161,13 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IPipelineIntents, PipelineIntents>();
         // Fusion service holds fix-to-fix state between cycles; singleton required.
         services.AddSingleton<IGpsHeadingFusionService, GpsHeadingFusionService>();
+        // Position estimator: GPS-anchored snapshot bridge between the GPS
+        // arrival path (10 Hz) and the host control loop (100 Hz). Singleton —
+        // single shared snapshot.
+        services.AddSingleton<IPositionEstimator, PositionEstimator>();
+        // Host control loop (#313): runs at 100 Hz on its own thread, sends
+        // PGN 254 + PGN 239 every tick to match the firmware autosteer cadence.
+        services.AddSingleton<ISteerMachineLoopService>(_ => new SteerMachineLoopService(frequencyHz: 100.0));
         services.AddSingleton<IGpsPipelineService, GpsPipelineService>();
 
         // iOS-specific services

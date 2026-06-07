@@ -125,27 +125,43 @@ public partial class MainViewModel
         get => _isSimulatorEnabled;
         set
         {
+            // Hardware parity stop: when DISABLING, emit one final stationary
+            // frame BEFORE flipping the flag. OnSimulatorGpsDataUpdated guards
+            // on !_isSimulatorEnabled and drops events once the flag flips,
+            // so a Tick after SetProperty would never reach the GPS pipeline.
+            // Without this, the position estimator's last snapshot retains
+            // non-zero speed, the 30 Hz vehicle render-pull tick dead-reckons
+            // the tractor forward up to MaxStaleSeconds (1 s), and the
+            // implement (which only updates on cycle results) sits frozen.
+            if (!value && _isSimulatorEnabled)
+            {
+                _simulatorService.StepDistance = 0;
+                _simulatorService.IsAcceleratingForward = false;
+                _simulatorService.IsAcceleratingBackward = false;
+                _simulatorService.Tick(SimulatorSteerAngle);
+            }
+
             if (SetProperty(ref _isSimulatorEnabled, value))
             {
                 // Update centralized state
                 State.Simulator.IsEnabled = value;
 
-                // Save to settings
-                _settingsService.Settings.SimulatorEnabled = value;
-                _settingsService.Save();
+                // Persist the "simulator is the GPS source" preference through
+                // the store (config), not by writing the DTO directly.
+                ConfigStore.Simulator.Enabled = value;
+                _configurationService.SaveAppSettings();
 
                 // Start or stop simulator timer based on enabled state
                 if (value)
                 {
-                    // Initialize simulator with saved coordinates
-                    var settings = _settingsService.Settings;
+                    // Initialize simulator with the last saved position (state).
                     _simulatorService.Initialize(new AgValoniaGPS.Models.Wgs84(
-                        settings.SimulatorLatitude,
-                        settings.SimulatorLongitude));
+                        PersistentState.SimulatorLatitude,
+                        PersistentState.SimulatorLongitude));
 
                     State.Simulator.IsRunning = true;
                     _simulatorTimer.Start();
-                    StatusMessage = $"Simulator ON at {settings.SimulatorLatitude:F8}, {settings.SimulatorLongitude:F8}";
+                    StatusMessage = $"Simulator ON at {PersistentState.SimulatorLatitude:F8}, {PersistentState.SimulatorLongitude:F8}";
                 }
                 else
                 {
@@ -164,6 +180,7 @@ public partial class MainViewModel
         {
             SetProperty(ref _simulatorSteerAngle, value);
             State.Simulator.SteerAngle = value;
+            PersistentState.SimulatorSteerAngle = value; // persisted on close
             OnPropertyChanged(nameof(SimulatorSteerAngleDisplay)); // Notify display property
             if (_isSimulatorEnabled)
             {
@@ -172,7 +189,7 @@ public partial class MainViewModel
         }
     }
 
-    public string SimulatorSteerAngleDisplay => $"Steer Angle: {_simulatorSteerAngle:F1}°";
+    public string SimulatorSteerAngleDisplay => $"{_simulatorSteerAngle:F1}°";
 
     /// <summary>
     /// Simulator speed in kph. Range: -10 to +25 kph (or -100 to +250 with 10x enabled).
@@ -209,6 +226,7 @@ public partial class MainViewModel
         double effectiveSpeed = _isSimulatorSpeed10x ? _simulatorSpeedKph * 10 : _simulatorSpeedKph;
         State.Simulator.Speed = effectiveSpeed;
         State.Simulator.TargetSpeed = effectiveSpeed;
+        PersistentState.SimulatorSpeed = effectiveSpeed; // persisted on close
         OnPropertyChanged(nameof(SimulatorSpeedDisplay));
         if (_isSimulatorEnabled)
         {
@@ -224,12 +242,14 @@ public partial class MainViewModel
     {
         get
         {
+            // No "(10x)" suffix — the 10x toggle sits beside this readout and the
+            // value already reflects the multiplier, so the readout stays compact
+            // enough to hug the speed arrows while fitting a 3-digit speed.
             double speed = _isSimulatorSpeed10x ? _simulatorSpeedKph * 10 : _simulatorSpeedKph;
-            string suffix = _isSimulatorSpeed10x ? " (10x)" : "";
             if (ConfigStore.IsMetric)
-                return $"Speed: {speed:F1} kph{suffix}";
+                return $"{speed:F1} kph";
             else
-                return $"Speed: {speed * 0.621371:F1} mph{suffix}";
+                return $"{speed * 0.621371:F1} mph";
         }
     }
 
@@ -254,15 +274,12 @@ public partial class MainViewModel
         // Reset steering
         SimulatorSteerAngle = 0;
 
-        // Save coordinates to settings so they persist
-        _settingsService.Settings.SimulatorLatitude = latitude;
-        _settingsService.Settings.SimulatorLongitude = longitude;
+        // Persist the last simulator position to the single source of truth —
+        // the persistent-state store (appstate.json). No DTO/multi-home writes.
+        PersistentState.SimulatorLatitude = latitude;
+        PersistentState.SimulatorLongitude = longitude;
 
-        // Also update ConfigurationStore so SaveAppSettings won't overwrite with stale values
-        Models.Configuration.ConfigurationStore.Instance.Simulator.Latitude = latitude;
-        Models.Configuration.ConfigurationStore.Instance.Simulator.Longitude = longitude;
-
-        var saved = _settingsService.Save();
+        var saved = _persistentStateService.Save();
 
         // Also update the Latitude/Longitude properties directly so that
         // the map boundary dialog uses the correct coordinates even if

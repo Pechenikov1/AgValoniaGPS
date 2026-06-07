@@ -3,6 +3,7 @@ using System.IO;
 using System.Text.Json;
 using AgValoniaGPS.Models;
 using AgValoniaGPS.Services.Interfaces;
+using AgValoniaGPS.Services.Storage;
 
 namespace AgValoniaGPS.IntegrationTests;
 
@@ -16,6 +17,10 @@ public class TestSettingsService : ISettingsService
     private readonly string _settingsFilePath;
 
     public AppSettings Settings { get; private set; }
+
+    public LoadOutcome LastLoadStatus { get; private set; } = LoadOutcome.Missing;
+
+    public DateTime? RecoveredBackupTime { get; private set; }
 
     public event EventHandler<AppSettings>? SettingsLoaded;
     public event EventHandler<AppSettings>? SettingsSaved;
@@ -39,7 +44,6 @@ public class TestSettingsService : ISettingsService
             {
                 Settings = new AppSettings
                 {
-                    IsFirstRun = true,
                     FieldsDirectory = Path.Combine(_basePath, "Fields")
                 };
                 return false;
@@ -57,7 +61,6 @@ public class TestSettingsService : ISettingsService
             if (loaded != null)
             {
                 Settings = loaded;
-                Settings.IsFirstRun = false;
 
                 // Override fields directory to point at our test data
                 Settings.FieldsDirectory = Path.Combine(_basePath, "Fields");
@@ -89,7 +92,6 @@ public class TestSettingsService : ISettingsService
     {
         Settings = new AppSettings
         {
-            IsFirstRun = false,
             FieldsDirectory = Path.Combine(_basePath, "Fields")
         };
     }

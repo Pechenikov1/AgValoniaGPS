@@ -29,6 +29,11 @@ bld/
 *.swp
 *~
 
+# RenderDoc capture artifacts (per-machine debug files)
+RenderDoc/
+*.rdc
+*.cap
+
 # NuGet
 *.nupkg
 *.snupkg
@@ -76,3 +81,10 @@ local.settings.json
 .fake
 .mcp.json
 pat.local
+
+# LSP / tooling per-csproj cache
+*.lscache
+
+# Android signing keystores — NEVER commit. Supplied to CI via secrets.
+*.keystore
+*.jks

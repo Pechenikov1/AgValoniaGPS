@@ -15,7 +15,9 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 using System;
+using System.Collections.Generic;
 using System.Globalization;
+using AgValoniaGPS.Models.State;
 using Avalonia.Data;
 using Avalonia.Data.Converters;
 using Avalonia.Media;
@@ -23,6 +25,29 @@ using Avalonia.Media.Imaging;
 using Avalonia.Platform;
 
 namespace AgValoniaGPS.Views.Converters;
+
+/// <summary>
+/// Network IO module status dot: inputs [configured, present].
+/// Not configured → gray (don't care); configured &amp; present → green;
+/// configured &amp; absent → red. "Present" = the module is responding
+/// (data-ok / scan reply).
+/// </summary>
+public class ModulePresenceToColorConverter : IMultiValueConverter
+{
+    public static readonly ModulePresenceToColorConverter Instance = new();
+
+    private static readonly IBrush PresentBrush = new SolidColorBrush(Color.Parse("#2ECC71")); // green
+    private static readonly IBrush AbsentBrush = new SolidColorBrush(Color.Parse("#E74C3C"));  // red
+    private static readonly IBrush NotConfiguredBrush = new SolidColorBrush(Color.Parse("#5A6473")); // gray
+
+    public object? Convert(IList<object?> values, Type targetType, object? parameter, CultureInfo culture)
+    {
+        bool configured = values.Count > 0 && values[0] is bool c && c;
+        bool present = values.Count > 1 && values[1] is bool p && p;
+        if (!configured) return NotConfiguredBrush;
+        return present ? PresentBrush : AbsentBrush;
+    }
+}
 
 public class BoolToColorConverter : IValueConverter
 {
@@ -188,6 +213,47 @@ public class FixQualityToColorConverter : IValueConverter
     }
 }
 
+/// <summary>
+/// Maps the rotator's paused/running state to a play/pause glyph. True =
+/// paused → ▶ (tap to resume); false = running → ⏸ (tap to pause).
+/// </summary>
+public class BoolToPlayPauseConverter : IValueConverter
+{
+    public static readonly BoolToPlayPauseConverter Instance = new();
+    public object? Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
+        => value is bool paused && paused ? "▶" : "⏸";
+    public object? ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
+        => BindingOperations.DoNothing;
+}
+
+/// <summary>
+/// Aggregate module-presence indicator: green when every configured module is
+/// producing data, yellow when ≥1 is missing, red when none are present.
+/// </summary>
+public class ModuleStatusKindToColorConverter : IValueConverter
+{
+    public static readonly ModuleStatusKindToColorConverter Instance = new();
+
+    public object? Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
+    {
+        if (value is ModuleStatusKind kind)
+        {
+            return kind switch
+            {
+                ModuleStatusKind.AllPresent       => Brushes.LimeGreen,
+                ModuleStatusKind.PartiallyPresent => Brushes.Gold,
+                _                                  => Brushes.OrangeRed,
+            };
+        }
+        return Brushes.OrangeRed;
+    }
+
+    public object? ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
+    {
+        return BindingOperations.DoNothing;
+    }
+}
+
 public class BoolToSteerColorConverter : IValueConverter
 {
     public object? Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
@@ -332,7 +398,7 @@ public class StringToImageConverter : IValueConverter
 
 /// <summary>
 /// Converts section color code to background brush for section buttons.
-/// Mirrors the renderer's 6-state palette in DrawingContextMapControl:
+/// Mirrors the renderer's 6-state palette:
 ///   0 = Off (red)
 ///   1 = Manual ON (yellow)
 ///   2 = Auto ON (green)
@@ -344,7 +410,7 @@ public class SectionColorCodeToBackgroundConverter : IValueConverter
 {
     public static readonly SectionColorCodeToBackgroundConverter Instance = new();
 
-    // Match the exact colors used in DrawingContextMapControl
+    // Match the exact colors used by the map renderer
     private static readonly IBrush RedBrush         = new SolidColorBrush(Color.FromRgb(242,  51,  51)); // #F23333 - Off
     private static readonly IBrush YellowBrush      = new SolidColorBrush(Color.FromRgb(247, 247,   0)); // #F7F700 - Manual On
     private static readonly IBrush GreenBrush       = new SolidColorBrush(Color.FromRgb(  0, 242,   0)); // #00F200 - Auto On

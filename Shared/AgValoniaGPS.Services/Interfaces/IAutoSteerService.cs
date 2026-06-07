@@ -76,6 +76,14 @@ public interface IAutoSteerService
     void UpdateGuidanceResults(double steerAngle, double crossTrackError);
 
     /// <summary>
+    /// Build and send PGN 254 + PGN 239 from the current vehicle state.
+    /// Called by the host control loop (#313) on every tick (100 Hz) so the
+    /// firmware autosteer task — which also runs at 100 Hz — sees a fresh
+    /// PGN every cycle.
+    /// </summary>
+    void SendPgnsForControlTick();
+
+    /// <summary>
     /// Engage auto-steer (start sending steering commands to hardware).
     /// </summary>
     void Engage();
@@ -142,10 +150,11 @@ public interface IAutoSteerService
     void SendMachinePinConfig();
 
     /// <summary>
-    /// Update machine control state sent via PGN 239.
+    /// Update machine control state sent via PGN 239 (low 16 sections) and,
+    /// when more than 16 sections are configured, PGN 229 (all 64 sections).
     /// Called by ViewModel after section control updates.
     /// </summary>
-    void SetMachineState(ushort sectionBits, bool isInUTurn, byte hydLiftState = 0);
+    void SetMachineState(ulong sectionBits, bool isInUTurn, byte hydLiftState = 0);
 
     // ═══════════════════════════════════════════════════════════════════════
     // Module Feedback (PGN 253, 250)
@@ -208,7 +217,7 @@ public readonly struct VehicleStateSnapshot
     public bool IsOnTrack { get; init; }
     public bool IsAutoSteerEngaged { get; init; }
 
-    public ushort SectionStates { get; init; }
+    public ulong SectionStates { get; init; }
     public bool MasterSectionOn { get; init; }
 
     public byte TramState { get; init; }

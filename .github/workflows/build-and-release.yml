@@ -95,6 +95,9 @@ jobs:
           - os: windows-latest
             rid: win-x64
             name: Windows-x64
+          - os: windows-latest
+            rid: win-arm64
+            name: Windows-ARM64
           - os: macos-latest
             rid: osx-arm64
             name: macOS-ARM64
@@ -104,6 +107,9 @@ jobs:
           - os: ubuntu-latest
             rid: linux-x64
             name: Linux-x64
+          - os: ubuntu-latest
+            rid: linux-arm64
+            name: Linux-ARM64
 
     runs-on: ${{ matrix.os }}
 
@@ -200,20 +206,46 @@ jobs:
       - name: Restore dependencies
         run: dotnet restore Platforms/AgValoniaGPS.Android/AgValoniaGPS.Android.csproj
 
-      - name: Build Android APK
+      - name: Decode signing keystore
+        id: keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
-          dotnet publish Platforms/AgValoniaGPS.Android/AgValoniaGPS.Android.csproj \
-            -c Release \
-            -f net10.0-android \
-            -o publish/android
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/agvalonia-release.keystore"
+            echo "path=$RUNNER_TEMP/agvalonia-release.keystore" >> "$GITHUB_OUTPUT"
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "Using committed release keystore for a stable signing identity."
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::ANDROID_KEYSTORE_BASE64 secret not set — falling back to the runner's ephemeral debug key. The resulting APK will NOT update over installs signed by a different build."
+          fi
+
+      - name: Build Android APK
+        env:
+          # Read by AndroidSigning*Pass=env: below (keeps secrets off the command line)
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          ARGS=(publish Platforms/AgValoniaGPS.Android/AgValoniaGPS.Android.csproj
+                -c Release
+                -f net10.0-android
+                -o publish/android)
+          if [ "${{ steps.keystore.outputs.present }}" = "true" ]; then
+            ARGS+=(-p:AndroidKeyStore=true
+                   "-p:AndroidSigningKeyStore=${{ steps.keystore.outputs.path }}"
+                   -p:AndroidSigningKeyAlias=agvalonia
+                   -p:AndroidSigningStorePass=env:KS_PASS
+                   -p:AndroidSigningKeyPass=env:KS_PASS)
+          fi
+          dotnet "${ARGS[@]}"
 
       - name: Find and rename APK
         run: |
-          APK=$(find publish/android -name "*.apk" | head -1)
+          APK=$(find publish/android -type f -name "*-Signed.apk" | head -1)
           if [ -n "$APK" ]; then
-            cp "$APK" AgValoniaGPS-Android.apk
+            cp "$APK" AgValoniaGPS-Android-Signed.apk
           else
-            echo "No APK found!"
+            echo "No signed APK found!"
             exit 1
           fi
 
@@ -221,7 +253,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: AgValoniaGPS-Android
-          path: AgValoniaGPS-Android.apk
+          path: AgValoniaGPS-Android-Signed.apk
           retention-days: 30
 
   # Build iOS (simulator .app bundle)
@@ -233,18 +265,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select Xcode 26.3
-        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+      - name: Select Xcode 26.4.1
+        # The .NET for iOS workload is pinned to 26.4.x via
+        # .github/workflows/dotnet-ios-rollback.json so it matches the
+        # Xcode_26.4.1.app that's fully installed on macos-26. The runner
+        # also has Xcode_26.5_beta_2.app, but its iOS 26.5 platform isn't
+        # actually downloaded ("iOS 26.5 Platform Not Installed" from
+        # ibtool), so the 26.5 track is unusable. Roll forward when Apple
+        # ships Xcode 26.5 GA and the runner image installs it complete.
+        run: sudo xcode-select -s /Applications/Xcode_26.4.1.app
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
-      - name: Install iOS workload
+      - name: Install iOS workload (pinned to 26.4.x)
         run: |
           for i in 1 2 3; do
-            dotnet workload install ios && break
+            dotnet workload install ios \
+              --from-rollback-file .github/workflows/dotnet-ios-rollback.json \
+              && break
             echo "Attempt $i failed, retrying in 10s..."
             sleep 10
           done
@@ -342,10 +383,12 @@ jobs:
             | Platform | File |
             |----------|------|
             | Windows x64 | `AgValoniaGPS-Windows-x64.zip` |
+            | Windows ARM64 | `AgValoniaGPS-Windows-ARM64.zip` |
             | macOS ARM64 (M1/M2/M3) | `AgValoniaGPS-macOS-ARM64.zip` |
             | macOS x64 (Intel) | `AgValoniaGPS-macOS-x64.zip` |
             | Linux x64 | `AgValoniaGPS-Linux-x64.zip` |
-            | Android | `AgValoniaGPS-Android.apk` |
+            | Linux ARM64 | `AgValoniaGPS-Linux-ARM64.zip` |
+            | Android | `AgValoniaGPS-Android-Signed.apk` |
             | iOS Simulator (ARM64) | `AgValoniaGPS-iOS-Simulator.zip` |
 
             ### Installation Notes
@@ -381,10 +424,12 @@ jobs:
             | Platform | File |
             |----------|------|
             | Windows x64 | `AgValoniaGPS-Windows-x64.zip` |
+            | Windows ARM64 | `AgValoniaGPS-Windows-ARM64.zip` |
             | macOS ARM64 (M1/M2/M3) | `AgValoniaGPS-macOS-ARM64.zip` |
             | macOS x64 (Intel) | `AgValoniaGPS-macOS-x64.zip` |
             | Linux x64 | `AgValoniaGPS-Linux-x64.zip` |
-            | Android | `AgValoniaGPS-Android.apk` |
+            | Linux ARM64 | `AgValoniaGPS-Linux-ARM64.zip` |
+            | Android | `AgValoniaGPS-Android-Signed.apk` |
             | iOS Simulator (ARM64) | `AgValoniaGPS-iOS-Simulator.zip` |
 
             ### Installation Notes

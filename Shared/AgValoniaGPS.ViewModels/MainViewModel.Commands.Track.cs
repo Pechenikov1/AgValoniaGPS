@@ -840,6 +840,14 @@ public partial class MainViewModel
 
         ToggleYouTurnCommand = new RelayCommand(() =>
         {
+            // No U-turns on a closed/polygon track — there's no field end to turn at (#421).
+            if (IsActiveTrackClosed)
+            {
+                IsYouTurnEnabled = false;
+                StatusMessage = "U-turns aren't available on a closed (polygon) track";
+                return;
+            }
+
             IsYouTurnEnabled = !IsYouTurnEnabled;
             SyncGuidanceStateToPipeline();
             StatusMessage = IsYouTurnEnabled ? "YouTurn enabled" : "YouTurn disabled";
@@ -847,6 +855,7 @@ public partial class MainViewModel
 
         ManualYouTurnLeftCommand = new RelayCommand(TriggerManualYouTurnLeft);
         ManualYouTurnRightCommand = new RelayCommand(TriggerManualYouTurnRight);
+        ToggleUTurnDirectionCommand = new RelayCommand(ToggleUTurnDirection);
 
         ToggleAutoSteerCommand = new RelayCommand(() =>
         {
@@ -859,25 +868,12 @@ public partial class MainViewModel
                 return;
             }
 
-            // If trying to engage, validate boundaries
-            if (!IsAutoSteerEngaged)
-            {
-                // Check for outer boundary
-                if (!HasBoundary || _currentBoundary?.OuterBoundary == null || !_currentBoundary.OuterBoundary.IsValid)
-                {
-                    ShowErrorDialog("Missing Boundary",
-                        "AutoSteer requires an outer boundary.\n\nPlease create or load a field boundary before engaging autosteer.");
-                    return;
-                }
-
-                // Headland is only required when U-turns are enabled
-                if (IsYouTurnEnabled && (!HasHeadland || _currentHeadlandLine == null || _currentHeadlandLine.Count < 3))
-                {
-                    ShowErrorDialog("Missing Headland",
-                        "U-Turn guidance requires a headland boundary.\n\nPlease create a headland using the Headland button in the boundary panel, or disable U-turns.");
-                    return;
-                }
-            }
+            // Engagement has no boundary/headland preconditions.
+            //  - No boundary: AB-lines-only workflow with manual sections.
+            //  - Boundary but no headland: auto-uturn still works against a
+            //    synthetic headland line inset from the outer boundary by
+            //    (UTurnRadius + UTurnDistanceFromBoundary). See
+            //    GpsPipelineService.GetOrComputeSyntheticHeadland.
 
             IsAutoSteerEngaged = !IsAutoSteerEngaged;
             _audioService.Play(IsAutoSteerEngaged
@@ -885,8 +881,13 @@ public partial class MainViewModel
                 : Services.Interfaces.SoundEffect.AutoSteerOff);
             if (IsAutoSteerEngaged)
             {
+                _autoSteerService.Engage();
                 double widthMinusOverlap = ConfigStore.ActualToolWidth - Tool.Overlap;
                 _logger.LogDebug($"[NUDGE] AutoSteer ENGAGED: State.Guidance.HowManyPathsAway={State.Guidance.HowManyPathsAway}, offset={State.Guidance.HowManyPathsAway * widthMinusOverlap:F2}m");
+            }
+            else
+            {
+                _autoSteerService.Disengage();
             }
             SyncGuidanceStateToPipeline();
             StatusMessage = IsAutoSteerEngaged ? "AutoSteer ENGAGED" : "AutoSteer disengaged";
@@ -979,7 +980,7 @@ public partial class MainViewModel
                     RefreshCoverageStatistics();
                     StatusMessage = "Applied area deleted";
                 });
-        });
+        }, () => IsFieldOpen);
 
         // Tram line commands
         ToggleTramDisplayCommand = new RelayCommand(() =>
@@ -1022,12 +1023,13 @@ public partial class MainViewModel
 
         BuildTramLinesCommand = new RelayCommand(() =>
         {
-            // Systems resolve their own references; only require selected track for legacy mode
-            if (ConfigStore.Tram.Systems.Count == 0 &&
-                (SelectedTrack == null || SelectedTrack.Points.Count < 2))
+            // Systems resolve their own references. Without systems we build
+            // controlled-traffic lanes parallel to the field boundary, so a boundary
+            // is required (no guidance track needed).
+            if (ConfigStore.Tram.Systems.Count == 0 && !HasBoundary)
             {
-                ShowErrorDialog("No Track Selected",
-                    "Select an AB line or curve track before building tram lines.");
+                ShowErrorDialog("No Boundary",
+                    "Create a field boundary before building tram lines.");
                 return;
             }
 
@@ -1237,7 +1239,7 @@ public partial class MainViewModel
 
         // Field Builder dialog
         ShowFieldBuilderCommand = new RelayCommand(() =>
-            State.UI.ShowDialog(Models.State.DialogType.FieldBuilder));
+            OpenChainDialog(Models.State.DialogType.FieldBuilder));
 
         CloseFieldBuilderCommand = new RelayCommand(() =>
             State.UI.CloseDialog());
@@ -1264,25 +1266,52 @@ public partial class MainViewModel
             }
 
             var pts = boundary.Points;
-            var curvePoints = new System.Collections.Generic.List<Models.Base.Vec3>();
+
+            // Offset the boundary inward by half the tool width so the guidance line
+            // sits half-an-implement inside the fence: following it rides the tool's
+            // OUTER edge along the boundary with the whole implement in the field. The
+            // raw boundary edge would put the vehicle (and line) on the fence, hanging
+            // half the sections out of bounds on the first pass (#422).
+            double halfTool = ConfigStore.ActualToolWidth / 2.0;
+            var boundaryVec2 = new System.Collections.Generic.List<Models.Base.Vec2>(pts.Count);
             for (int i = 0; i < pts.Count; i++)
-            {
-                curvePoints.Add(new Models.Base.Vec3(pts[i].Easting, pts[i].Northing, pts[i].Heading));
-            }
+                boundaryVec2.Add(new Models.Base.Vec2(pts[i].Easting, pts[i].Northing));
+
+            var offset = halfTool > 0.05
+                ? _polygonOffsetService.CreateInwardOffset(boundaryVec2, halfTool)
+                : null;
+
+            // Fall back to the raw boundary if the offset failed (e.g. tool wider than
+            // the field can accommodate at that point).
+            var ring = (offset != null && offset.Count >= 3) ? offset : boundaryVec2;
+
+            var curvePoints = new System.Collections.Generic.List<Models.Base.Vec3>(ring.Count + 1);
+            for (int i = 0; i < ring.Count; i++)
+                curvePoints.Add(new Models.Base.Vec3(ring[i].Easting, ring[i].Northing, 0));
             // Close the loop
-            curvePoints.Add(new Models.Base.Vec3(pts[0].Easting, pts[0].Northing, pts[0].Heading));
+            curvePoints.Add(new Models.Base.Vec3(ring[0].Easting, ring[0].Northing, 0));
+
+            // Recompute per-point headings in the curve-segment convention
+            // (atan2(dEast,dNorth)). Guidance's "which way is forward" test keys
+            // entirely off these headings; copying the boundary's stored heading
+            // (often 0 or a different convention) made the direction decision
+            // random and the vehicle spin/reverse on the curve (#422).
+            curvePoints = Models.Guidance.CurveProcessing.CalculateHeadings(curvePoints);
 
             var track = new Models.Track.Track
             {
                 Name = "Boundary Curve",
                 Points = curvePoints,
                 Type = Models.Track.TrackType.Curve,
-                IsVisible = true
+                IsVisible = true,
+                // The boundary curve is a closed loop; guidance must wrap at the
+                // seam instead of treating it as an open polyline that "ends".
+                IsClosed = true
             };
 
             SavedTracks.Add(track);
             SelectedTrack = track;
-            StatusMessage = $"Created boundary curve ({curvePoints.Count} points)";
+            StatusMessage = $"Created boundary curve ({curvePoints.Count} points, {halfTool:F1} m inside fence)";
         });
 
         CreateTracksFromAllEdgesCommand = new RelayCommand(() =>

@@ -42,6 +42,14 @@ public partial class MainViewModel
         set => SetProperty(ref _isYouTurnEnabled, value);
     }
 
+    /// <summary>
+    /// True when the active track is a closed loop (polygon / boundary curve /
+    /// water pivot). U-turns make no sense on a closed track — there's no field
+    /// end to turn at, you just drive the loop continuously — so they're disabled
+    /// and the U-turn button is hidden in that case (#421).
+    /// </summary>
+    public bool IsActiveTrackClosed => SelectedTrack?.IsClosed == true;
+
     private int _uTurnSkipRows;
     /// <summary>Number of rows to skip during U-turn (0–9).</summary>
     public int UTurnSkipRows
@@ -68,6 +76,77 @@ public partial class MainViewModel
         set => SetProperty(ref _isSkipWorkedMode, value);
     }
 
+    private bool? _nextUTurnDirectionLeftOverride;
+    /// <summary>
+    /// When the user taps the U-turn direction toggle while no turn is currently
+    /// armed, this flag captures the desired direction for the *next* armed turn.
+    /// Mirrors legacy <c>FormGPS.SwapDirection</c> behavior of pre-flipping
+    /// <c>yt.isTurnLeft</c> before the next trigger. The setter forwards to the
+    /// cycle worker via <see cref="Services.Interfaces.IGpsPipelineService.SetNextUTurnDirectionLeftOverride"/>;
+    /// the state machine consumes and clears the override on the next
+    /// turn-creation tick, and <see cref="ApplyGpsCycleResult"/> clears the
+    /// UI's cache back to <c>null</c> when the snapshot reports the working
+    /// state's override has been consumed.
+    ///
+    /// Nullable: <c>null</c> means "no operator preference — let the auto-arm
+    /// decide". Without the nullable shape the UI's value leaked into the
+    /// cycle every tick, so once consumed, the same UI cache re-wrote the
+    /// working state with the same biased value on the next turn (the
+    /// stuck-override bug).
+    /// </summary>
+    public bool? NextUTurnDirectionLeftOverride
+    {
+        get => _nextUTurnDirectionLeftOverride;
+        set
+        {
+            if (SetProperty(ref _nextUTurnDirectionLeftOverride, value))
+            {
+                _gpsPipelineService.SetNextUTurnDirectionLeftOverride(value);
+            }
+        }
+    }
+
+    /// <summary>
+    /// True when the U-turn distance-to-trigger widget should be shown.
+    /// Visible while YouTurn is enabled AND either:
+    ///   - the state machine has populated a meaningful approach distance
+    ///     (<c>DistanceToTrigger &gt; 0.5</c> m), OR
+    ///   - the turn is already armed (<c>IsTriggered</c>) or executing.
+    /// The original implementation gated only on <c>IsTriggered</c>, which
+    /// becomes true at the same instant the turn starts executing — the user
+    /// only ever saw the widget showing 0 m mid-turn. Showing during approach
+    /// matches legacy AgOpenGPS UTurn-button behavior.
+    /// </summary>
+    public bool IsUTurnDistanceVisible
+    {
+        get
+        {
+            var yt = State.YouTurn;
+            return yt.IsEnabled && (yt.DistanceToTrigger > 0.5 || yt.IsTriggered || yt.IsExecuting);
+        }
+    }
+
+    /// <summary>
+    /// Subscribe to <see cref="YouTurnState"/> property changes that affect
+    /// <see cref="IsUTurnDistanceVisible"/> so the bound AXAML re-evaluates
+    /// when the state machine snapshot lands.
+    /// Called once from the MainViewModel constructor.
+    /// </summary>
+    private void WireYouTurnDistanceVisibility()
+    {
+        State.YouTurn.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName is
+                nameof(Models.State.YouTurnState.IsEnabled) or
+                nameof(Models.State.YouTurnState.IsTriggered) or
+                nameof(Models.State.YouTurnState.IsExecuting) or
+                nameof(Models.State.YouTurnState.DistanceToTrigger))
+            {
+                OnPropertyChanged(nameof(IsUTurnDistanceVisible));
+            }
+        };
+    }
+
     #endregion
 
     #region YouTurn Entry Points
@@ -82,9 +161,59 @@ public partial class MainViewModel
     /// <summary>Clear all U-turn state — called on field close or track deselect.</summary>
     public void ClearYouTurnState() => _intents.RequestClearYouTurn();
 
-    public void TriggerManualYouTurnLeft() => _intents.RequestManualYouTurn(turnLeft: true);
+    public void TriggerManualYouTurnLeft()
+    {
+        if (IsActiveTrackClosed) { StatusMessage = "U-turns aren't available on a closed (polygon) track"; return; }
+        _intents.RequestManualYouTurn(turnLeft: true);
+    }
 
-    public void TriggerManualYouTurnRight() => _intents.RequestManualYouTurn(turnLeft: false);
+    public void TriggerManualYouTurnRight()
+    {
+        if (IsActiveTrackClosed) { StatusMessage = "U-turns aren't available on a closed (polygon) track"; return; }
+        _intents.RequestManualYouTurn(turnLeft: false);
+    }
+
+    /// <summary>
+    /// Toggle the U-turn direction. Mirrors legacy <c>FormGPS.SwapDirection</c>
+    /// (AgOpen_Snapshot/GPS/Forms/GUI.Designer.cs:1426).
+    ///
+    /// Behavior:
+    /// - Turn currently executing: no-op (unsafe to flip mid-turn).
+    /// - Otherwise: post the desired direction through
+    ///   <see cref="NextUTurnDirectionLeftOverride"/>. The cycle's state
+    ///   machine consumes the override on the next tick — if a path is
+    ///   already rendered it drops it and recreates with the new direction
+    ///   in the same cycle. Result: arrow and path stay in sync.
+    ///
+    /// The armed branch used to mutate <c>State.YouTurn.IsTurnLeft</c>
+    /// directly. That visual flip lived ~1 cycle before
+    /// <see cref="ApplyGpsCycleResult"/>'s snapshot mirror reverted it,
+    /// producing a transient arrow-vs-rendered-path mismatch — operator-
+    /// confirmed. Routing through the override path eliminates that
+    /// disagreement.
+    /// </summary>
+    public void ToggleUTurnDirection()
+    {
+        if (State.YouTurn.IsExecuting)
+        {
+            StatusMessage = "Cannot flip U-turn direction while executing";
+            return;
+        }
+
+        // Current displayed direction:
+        //   - When armed, the arrow binds to State.YouTurn.IsTurnLeft.
+        //   - When idle, it binds to NextUTurnDirectionLeftOverride; null
+        //     means "no preference" — treat as right (false) so the first
+        //     tap produces a left toggle.
+        bool currentDisplayLeft = State.YouTurn.IsTriggered
+            ? State.YouTurn.IsTurnLeft
+            : (NextUTurnDirectionLeftOverride ?? false);
+
+        NextUTurnDirectionLeftOverride = !currentDisplayLeft;
+        StatusMessage = NextUTurnDirectionLeftOverride == true
+            ? "U-turn direction: Left"
+            : "U-turn direction: Right";
+    }
 
     #endregion
 

@@ -36,20 +36,28 @@ public partial class MainViewModel
 {
     private void InitializeSettingsCommands()
     {
-        ShowAppDirectoriesDialogCommand = new RelayCommand(() =>
+        ShowAppSettingsDialogCommand = new RelayCommand(() =>
         {
+            // Units/System toggles bind to ConfigurationViewModel; lazy-init it
+            // (mirrors ShowConfigurationDialogCommand) so they work even if the
+            // user never opened Configuration first. App Directories (folded in
+            // from the old separate dialog) needs its list refreshed.
+            if (ConfigurationViewModel == null)
+            {
+                ConfigurationViewModel = new ConfigurationViewModel(_configurationService);
+            }
             RefreshAppDirectories();
-            State.UI.ShowDialog(Models.State.DialogType.AppDirectories);
+            OpenChainDialog(Models.State.DialogType.AppSettings);
         });
 
-        CloseAppDirectoriesDialogCommand = new RelayCommand(() =>
+        CloseAppSettingsDialogCommand = new RelayCommand(() =>
         {
             State.UI.CloseDialog();
         });
 
         ShowAboutDialogCommand = new RelayCommand(() =>
         {
-            State.UI.ShowDialog(Models.State.DialogType.About);
+            OpenChainDialog(Models.State.DialogType.About);
         });
 
         CloseAboutDialogCommand = new RelayCommand(() =>
@@ -75,9 +83,15 @@ public partial class MainViewModel
         ShowLogViewerDialogCommand = new RelayCommand(() =>
         {
             RefreshLogEntries();
-            _logStoreSubscribed = true;
-            LogStore.Instance.LogAdded += OnLogStoreUpdated;
-            State.UI.ShowDialog(Models.State.DialogType.LogViewer);
+            // Guard against a double subscription: with the chain model the dialog
+            // can be dismissed via Back/Close (cleanup runs on hide), so only wire
+            // the LogStore handler when not already subscribed.
+            if (!_logStoreSubscribed)
+            {
+                LogStore.Instance.LogAdded += OnLogStoreUpdated;
+                _logStoreSubscribed = true;
+            }
+            OpenChainDialog(Models.State.DialogType.LogViewer);
         });
 
         CloseLogViewerDialogCommand = new RelayCommand(() =>
@@ -125,7 +139,7 @@ public partial class MainViewModel
         ShowViewSettingsDialogCommand = new RelayCommand(() =>
         {
             RefreshSettingsTree();
-            State.UI.ShowDialog(Models.State.DialogType.ViewSettings);
+            OpenChainDialog(Models.State.DialogType.ViewSettings);
         });
 
         CloseViewSettingsDialogCommand = new RelayCommand(() =>
@@ -136,7 +150,7 @@ public partial class MainViewModel
         // Help (#16)
         ShowHelpDialogCommand = new RelayCommand(() =>
         {
-            State.UI.ShowDialog(Models.State.DialogType.Help);
+            OpenChainDialog(Models.State.DialogType.Help);
         });
 
         CloseHelpDialogCommand = new RelayCommand(() =>
@@ -147,7 +161,7 @@ public partial class MainViewModel
         // Language Selection (#40)
         ShowLanguageDialogCommand = new RelayCommand(() =>
         {
-            State.UI.ShowDialog(Models.State.DialogType.Language);
+            OpenChainDialog(Models.State.DialogType.Language);
         });
 
         CloseLanguageDialogCommand = new RelayCommand(() =>
@@ -158,8 +172,11 @@ public partial class MainViewModel
         SetLanguageCommand = new RelayCommand<string>(code =>
         {
             if (string.IsNullOrEmpty(code)) return;
+            // Language lives only in AppSettings (no store mirror); set it on the
+            // DTO, then persist via SaveAppSettings so the rest of the file stays
+            // in sync with the store (avoids writing a stale DTO).
             _settingsService.Settings.Language = code;
-            _settingsService.Save();
+            _configurationService.SaveAppSettings();
 
             // Notify that language changed - Views layer applies via LanguageChanged event
             LanguageChanged?.Invoke(code);
@@ -199,7 +216,11 @@ public partial class MainViewModel
         // Bug Report Dialog (#249)
         ShowBugReportDialogCommand = new RelayCommand(() =>
         {
-            // Capture screenshot BEFORE dialog opens (so it shows the actual state)
+            // Capture screenshot AND the full state-snapshot zip the moment
+            // the button is pressed, so the dump reflects app state when the
+            // bug occurred — not whatever state the operator drifts into
+            // while typing the title and description. Notes + user
+            // attachments get appended to the captured zip on submit.
             _bugReportScreenshot = null;
             try { _bugReportScreenshot = ScreenshotProvider?.Invoke(); }
             catch { /* screenshot is optional */ }
@@ -207,13 +228,55 @@ public partial class MainViewModel
             BugReportTitle = string.Empty;
             BugReportDescription = string.Empty;
             BugReportAttachments.Clear();
-            State.UI.ShowDialog(Models.State.DialogType.BugReport);
+
+            _bugReportTempZipPath = null;
+            try
+            {
+                _bugReportTempZipPath = Services.DebugDumpService.CreateDump(
+                    _settingsService, _appState, screenshotPng: _bugReportScreenshot);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Bug report state-snapshot capture failed");
+                StatusMessage = $"Bug report capture failed: {ex.Message}";
+            }
+
+            OpenChainDialog(Models.State.DialogType.BugReport);
         });
 
         CloseBugReportDialogCommand = new RelayCommand(() =>
         {
             _bugReportScreenshot = null;
             BugReportAttachments.Clear();
+
+            // User cancelled — keep the captured snapshot but finalize it
+            // without notes/attachments so the dump (which reflects app
+            // state at the moment they pressed the button) isn't lost.
+            if (_bugReportTempZipPath != null && File.Exists(_bugReportTempZipPath))
+            {
+                try
+                {
+                    var bugReportsDir = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                        "AgValoniaGPS", "BugReports");
+
+                    var savedPath = Services.DebugDumpService.FinalizeBugReport(
+                        sourceZipPath: _bugReportTempZipPath,
+                        outputDirectory: bugReportsDir,
+                        filePrefix: "bugreport_unnamed",
+                        notes: null,
+                        userAttachments: null);
+
+                    StatusMessage = $"Bug report saved (no details): {savedPath}";
+                    _logger.LogInformation("Bug report saved on cancel: {ZipPath}", savedPath);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to finalize cancelled bug report snapshot");
+                }
+            }
+            _bugReportTempZipPath = null;
+
             State.UI.CloseDialog();
         });
 
@@ -256,14 +319,32 @@ public partial class MainViewModel
                     ? BugReportDescription
                     : $"# {BugReportTitle}\n\n{BugReportDescription}";
 
-                var zipPath = Services.DebugDumpService.CreateDump(
-                    _settingsService,
-                    _appState,
-                    additionalNotes: notes,
-                    screenshotPng: _bugReportScreenshot,
-                    outputDirectory: bugReportsDir,
-                    filePrefix: $"bugreport_{titleSlug}",
-                    userAttachments: attachmentPaths);
+                string zipPath;
+                if (_bugReportTempZipPath != null && File.Exists(_bugReportTempZipPath))
+                {
+                    // Snapshot already exists from button-press; just append
+                    // the user's title/description/attachments and rename.
+                    zipPath = Services.DebugDumpService.FinalizeBugReport(
+                        sourceZipPath: _bugReportTempZipPath,
+                        outputDirectory: bugReportsDir,
+                        filePrefix: $"bugreport_{titleSlug}",
+                        notes: notes,
+                        userAttachments: attachmentPaths);
+                    _bugReportTempZipPath = null;
+                }
+                else
+                {
+                    // Fallback: snapshot capture failed at button-press; do
+                    // everything in one shot now.
+                    zipPath = Services.DebugDumpService.CreateDump(
+                        _settingsService,
+                        _appState,
+                        additionalNotes: notes,
+                        screenshotPng: _bugReportScreenshot,
+                        outputDirectory: bugReportsDir,
+                        filePrefix: $"bugreport_{titleSlug}",
+                        userAttachments: attachmentPaths);
+                }
 
                 _bugReportScreenshot = null;
                 BugReportAttachments.Clear();
@@ -321,6 +402,9 @@ public partial class MainViewModel
     public ICommand? RemoveBugReportAttachmentCommand { get; private set; }
 
     private byte[]? _bugReportScreenshot;
+    // Path to the dump zip captured the moment the user pressed the Bug
+    // Report button. Cleared on submit or dialog cancel.
+    private string? _bugReportTempZipPath;
 
     private string _bugReportTitle = string.Empty;
     public string BugReportTitle
@@ -525,7 +609,7 @@ public partial class MainViewModel
 
         // Global settings
         var global = new SettingsGroupItem("Global");
-        global.Items.Add(new SettingsValueItem("Active Profile", store.ActiveProfileName));
+        global.Items.Add(new SettingsValueItem("Active Profile", store.ActiveVehicleProfileName));
         global.Items.Add(new SettingsValueItem("Is Metric", store.IsMetric.ToString()));
         global.Items.Add(new SettingsValueItem("Num Sections", store.NumSections.ToString()));
         global.Items.Add(new SettingsValueItem("Actual Tool Width", $"{store.ActualToolWidth:F2} m"));

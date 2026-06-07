@@ -1,6 +1,7 @@
 using AgValoniaGPS.Models;
 using AgValoniaGPS.Models.State;
 using AgValoniaGPS.Services;
+using AgValoniaGPS.Services.Battery;
 using AgValoniaGPS.Services.Interfaces;
 using AgValoniaGPS.Services.YouTurn;
 using AgValoniaGPS.ViewModels;
@@ -79,10 +80,13 @@ public class MainViewModelBuilder
             chartDataService: Substitute.For<IChartDataService>(),
             audioService: Substitute.For<IAudioService>(),
             elevationLogService: Substitute.For<IElevationLogService>(),
+            jobService: Substitute.For<IJobService>(),
             tramLineService: Substitute.For<AgValoniaGPS.Services.Interfaces.ITramLineService>(),
             gpsPipelineService: GpsPipelineService,
             intents: Intents,
             logger: NullLogger<MainViewModel>.Instance,
-            appState: new ApplicationState());
+            appState: new ApplicationState(),
+            persistentStateService: Substitute.For<IPersistentStateService>(),
+            batteryService: new NullBatteryService());
     }
 }

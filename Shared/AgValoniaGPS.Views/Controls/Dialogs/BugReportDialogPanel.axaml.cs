@@ -24,7 +24,17 @@ public partial class BugReportDialogPanel : UserControl
     private void Backdrop_PointerPressed(object? sender, PointerPressedEventArgs e)
     {
         if (DataContext is AgValoniaGPS.ViewModels.MainViewModel vm)
-            vm.CloseBugReportDialogCommand?.Execute(null);
+            vm.NavCloseChainCommand?.Execute(null);
+    }
+
+    // Stop pointer events on the dialog body chrome from bubbling up to
+    // the backdrop's PointerPressed handler — otherwise clicking anywhere
+    // inside the form (between fields/buttons) would close the dialog.
+    // Drag-drop on the attachments DropZone is unaffected because drag
+    // events use a different routed-event class.
+    private void Body_PointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        e.Handled = true;
     }
 
     private void DropZone_DragOver(object? sender, DragEventArgs e)

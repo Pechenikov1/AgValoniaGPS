@@ -22,41 +22,101 @@ using CommunityToolkit.Mvvm.Input;
 namespace AgValoniaGPS.ViewModels;
 
 /// <summary>
-/// Navigation panel commands - view toggles, camera controls, brightness.
+/// Navigation panel commands - view toggles, camera controls.
 /// </summary>
 public partial class MainViewModel
 {
     private void InitializeNavigationCommands()
     {
-        // Panel toggle commands
-        ToggleViewSettingsPanelCommand = new RelayCommand(() =>
+        // When any dialog opens (e.g. a fly-out item launches one), dismiss the
+        // open left-nav fly-out so menus don't linger behind the dialog.
+        State.UI.DialogChanged += (_, e) =>
         {
-            IsViewSettingsPanelVisible = !IsViewSettingsPanelVisible;
+            if (e.Current != Models.State.DialogType.None)
+                CloseAllNavFlyouts();
+            // Re-evaluate whether a confirmation can offer a Back-to-fly-out button
+            // (it depends on which fly-out, if any, was just closed).
+            if (e.Current == Models.State.DialogType.Confirmation)
+                OnPropertyChanged(nameof(IsConfirmationBackVisible));
+            // The Vehicle/Tool config dialogs edit the live store and have no Apply
+            // button; persist the active profiles to disk when navigating away from
+            // them (Back to the picker or Close to the map) so edits aren't lost.
+            if (e.Previous is Models.State.DialogType.VehicleConfig
+                or Models.State.DialogType.ToolConfig)
+            {
+                _configurationService.SaveProfiles(
+                    _configurationService.Store.ActiveVehicleProfileName,
+                    _configurationService.Store.ActiveToolProfileName);
+            }
+        };
+
+        // Panel toggle commands. Only one left-nav fly-out is open at a time:
+        // each toggle closes the others first, then opens (or closes) its own.
+        ToggleScreenAlertsPanelCommand = new RelayCommand(() =>
+        {
+            bool open = !IsScreenAlertsPanelVisible;
+            CloseAllNavFlyouts();
+            // The panel's display/sounds/buttons sections bind to
+            // ConfigurationViewModel, which is created lazily; mirror the
+            // config-backed dialogs so the bindings resolve on first open.
+            if (open && ConfigurationViewModel == null)
+            {
+                ConfigurationViewModel = new ConfigurationViewModel(_configurationService);
+            }
+            IsScreenAlertsPanelVisible = open;
         });
 
         ToggleFileMenuPanelCommand = new RelayCommand(() =>
         {
-            IsFileMenuPanelVisible = !IsFileMenuPanelVisible;
+            bool open = !IsFileMenuPanelVisible;
+            CloseAllNavFlyouts();
+            IsFileMenuPanelVisible = open;
         });
 
         ToggleToolsPanelCommand = new RelayCommand(() =>
         {
-            IsToolsPanelVisible = !IsToolsPanelVisible;
+            bool open = !IsToolsPanelVisible;
+            CloseAllNavFlyouts();
+            IsToolsPanelVisible = open;
         });
 
-        ToggleConfigurationPanelCommand = new RelayCommand(() =>
+        ToggleFieldOperationsPanelCommand = new RelayCommand(() =>
         {
-            IsConfigurationPanelVisible = !IsConfigurationPanelVisible;
-        });
-
-        ToggleJobMenuPanelCommand = new RelayCommand(() =>
-        {
-            IsJobMenuPanelVisible = !IsJobMenuPanelVisible;
+            bool open = !IsFieldOperationsPanelVisible;
+            CloseAllNavFlyouts();
+            IsFieldOperationsPanelVisible = open;
         });
 
         ToggleFieldToolsPanelCommand = new RelayCommand(() =>
         {
-            IsFieldToolsPanelVisible = !IsFieldToolsPanelVisible;
+            bool open = !IsFieldToolsPanelVisible;
+            CloseAllNavFlyouts();
+            IsFieldToolsPanelVisible = open;
+        });
+
+        ToggleNetworkIoPanelCommand = new RelayCommand(() =>
+        {
+            bool open = !IsNetworkIoPanelVisible;
+            CloseAllNavFlyouts();
+            IsNetworkIoPanelVisible = open;
+        });
+
+        // The fly-out close (X) is a pure close, not a toggle: a toggle would
+        // re-open the panel because the bubbling item-close already shut it.
+        CloseAllNavFlyoutsCommand = new RelayCommand(CloseAllNavFlyouts);
+
+        // Back from a Field Tools tool overlay (boundary recording, recorded path,
+        // offset-fix pad): close the overlays and reopen the Field Tools fly-out.
+        // These are bool-visibility panels, not DialogType dialogs, so they use
+        // this dedicated command rather than the dialog back-stack.
+        BackToFieldToolsCommand = new RelayCommand(() =>
+        {
+            IsBoundaryPanelVisible = false;
+            IsRecordedPathPanelVisible = false;
+            State.UI.IsOffsetFixPanelVisible = false;
+            // Route through the chain Back path so Field Tools reopens where the
+            // chain currently is (flagged reopen) rather than snapping home.
+            ReopenFlyout(NavFlyout.FieldTools);
         });
 
         ToggleAutoTrackCommand = new RelayCommand(() =>
@@ -107,12 +167,14 @@ public partial class MainViewModel
         ToggleCameraModeCommand = new RelayCommand(() =>
         {
             var oldMode = CameraMode;
+            // Explicit 4-state cycle: H -> N -> M -> C -> H
             CameraMode = CameraMode switch
             {
-                Models.CameraMode.Free => _previousCameraMode, // Return to previous mode
-                Models.CameraMode.NorthUp => Models.CameraMode.HeadingUp,
                 Models.CameraMode.HeadingUp => Models.CameraMode.NorthUp,
-                _ => Models.CameraMode.NorthUp
+                Models.CameraMode.NorthUp => Models.CameraMode.Map,
+                Models.CameraMode.Map => Models.CameraMode.Free,
+                Models.CameraMode.Free => Models.CameraMode.HeadingUp,
+                _ => Models.CameraMode.Map
             };
             Console.WriteLine($"[Compass] {oldMode} -> {CameraMode}");
         });
@@ -147,17 +209,6 @@ public partial class MainViewModel
             {
                 CameraPitch += 5.0;
             }
-        });
-
-        // Brightness controls
-        IncreaseBrightnessCommand = new RelayCommand(() =>
-        {
-            Brightness += 5;
-        });
-
-        DecreaseBrightnessCommand = new RelayCommand(() =>
-        {
-            Brightness -= 5;
         });
 
         // Display resolution: cycle Ultra → High → Medium → Low → Min → Ultra

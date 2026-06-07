@@ -43,13 +43,60 @@ public class SectionControlService : ISectionControlService
     private readonly SectionControlState[] _sectionStates;
     private SectionMasterState _masterState = SectionMasterState.Off;
 
-    // Timing thresholds (in update cycles, typically 10Hz = 100ms per cycle)
-    private const int SECTION_ON_DELAY = 2;   // ~200ms delay before turning on
-    private const int MAPPING_ON_DELAY = 2;   // ~200ms delay before recording coverage
-    private const int MAPPING_OFF_DELAY = 2;  // ~200ms delay before stopping coverage
+    // Timing in seconds. The state machine honors *only* what the user
+    // configures via Tool.LookAheadOnSetting / LookAheadOffSetting — no
+    // built-in floors. Per-tick math is rate-independent via TickHz.
+    //
+    // MAPPING_ON_DELAY_SECONDS = 0: the section's own LookAheadOn timing
+    //   (configured by the user) already gates the IsOn flip; an extra
+    //   mapping-side debounce would just leave an unsprayed gap.
+    // MAPPING_OFF_DELAY_SECONDS: kept non-zero so a brief shouldBeOff /
+    //   shouldBeOn flicker doesn't tear the strip — UpdateMapping continues
+    //   painting through the debounce since IsMappingOn is still true.
+    private const double MAPPING_ON_DELAY_SECONDS = 0.0;
+    private const double MAPPING_OFF_DELAY_SECONDS = 0.2;
+
+    /// <summary>
+    /// Rate at which <see cref="Update"/> is being called. Defaults to
+    /// 10 Hz (legacy GPS-cycle cadence). The host control loop (#313)
+    /// sets this to 100 Hz for sub-frame section control. Used to convert
+    /// seconds-based delays into integer tick thresholds.
+    /// </summary>
+    public double TickHz { get; set; } = 10.0;
+
+    // Section ON/OFF phase ticks are derived from turnOnPhaseSec /
+    // turnOffPhaseSec (which already include the SECTION_ON_DELAY_SECONDS /
+    // 0.1 s minimum floors for debounce); see UpdateSection. Mapping
+    // delays are separate concerns.
+    private int MappingOnDelayTicks => (int)Math.Round(MAPPING_ON_DELAY_SECONDS * TickHz);
+    private int MappingOffDelayTicks => (int)Math.Round(MAPPING_OFF_DELAY_SECONDS * TickHz);
 
     // Default coverage overlap threshold (used if MinCoverage is 0)
     private const double DEFAULT_COVERAGE_THRESHOLD = 0.70; // 70%
+
+    // OFF threshold: section stays on until its swath is essentially fully
+    // covered, so a pass over a partly-painted strip fills the holes instead
+    // of turning the section off as soon as it reads "mostly covered". A
+    // section-wide threshold tied to MinCoverage caused #348 (gaps don't
+    // fill on subsequent passes); decoupling the OFF decision from
+    // MinCoverage and pinning it near full coverage is the principled fix.
+    // 0.99 (with 0.01 tolerance for FP / pixel noise around 100 %) keeps the
+    // section on through any meaningful gap. MarkCellCovered is already
+    // idempotent so over-painting covered cells is a no-op.
+    private const double COVERAGE_OFF_THRESHOLD = 0.99;
+
+    // Floor on the forward distance from section center to the look-on /
+    // look-off sample points. lookAheadDistance = speed × LookAheadSetting,
+    // so at slow speed and/or LookAheadSetting=0 (the default) it goes to
+    // zero — the look-on/off check then samples cells at the section center,
+    // i.e. inside the section's own freshly-painted swath. shouldBeOff fires
+    // off the section's own coverage, IsOn flips off, paint stops; the next
+    // tick the section has crept past its own paint slightly, shouldBeOn
+    // fires, IsOn flips back on. This is the slow-speed flicker in #345.
+    // 0.3 m (3 detection cells) is enough to clear the painted swath
+    // longitudinally without changing behavior at normal speeds, where
+    // speed × time already exceeds it.
+    private const double MIN_LOOKAHEAD_FORWARD_DISTANCE_METERS = 0.3;
 
     // Minimum distance (squared) between coverage points to reduce edge jaggedness
     // At 10Hz and 10 kph (2.78 m/s), vehicle moves ~0.28m per update
@@ -59,14 +106,6 @@ public class SectionControlService : ISectionControlService
 
     // Last coverage point position per zone (for minimum distance filtering)
     private readonly Dictionary<int, Vec2> _lastCoveragePosition = new();
-
-    // Coverage check throttling - don't check every frame (too expensive with many patches)
-    private const double COVERAGE_CHECK_INTERVAL_MS = 150; // Check coverage every 150ms
-    private long _coverageThrottleTimestamp = Clock.Current.GetTimestamp();
-    private readonly CoverageResult[] _cachedCurrentCoverage = new CoverageResult[16];
-    private readonly CoverageResult[] _cachedLookOnCoverage = new CoverageResult[16];
-    private readonly CoverageResult[] _cachedLookOffCoverage = new CoverageResult[16];
-    private bool _coverageCacheValid = false;
 
     // Yaw rate tracking for curve-following coverage margin
     private double _previousHeading = double.NaN;
@@ -132,8 +171,8 @@ public class SectionControlService : ISectionControlService
         _state = state;
 
         // Initialize section states
-        _sectionStates = new SectionControlState[16];
-        for (int i = 0; i < 16; i++)
+        _sectionStates = new SectionControlState[ToolConfig.MaxSections];
+        for (int i = 0; i < _sectionStates.Length; i++)
         {
             _sectionStates[i] = new SectionControlState { Index = i };
         }
@@ -214,7 +253,8 @@ public class SectionControlService : ISectionControlService
         // MANUAL ON sections active so coverage doesn't gap on stop/restart.
         // SlowSpeedCutoff is stored in km/h (matching the UI); speed is m/s.
         double slowSpeedCutoffMps = tool.SlowSpeedCutoff / 3.6;
-        if (speed < slowSpeedCutoffMps)
+        bool isSlowSpeedCutoff = speed < slowSpeedCutoffMps;
+        if (isSlowSpeedCutoff)
         {
             for (int i = 0; i < numSections; i++)
             {
@@ -232,22 +272,17 @@ public class SectionControlService : ISectionControlService
         _totalHeadlandMs = 0;
         _totalCoverageMs = 0;
 
-        // Check if coverage cache should be invalidated (throttle coverage checks)
-        var now = Clock.Current.GetTimestamp();
-        if (Clock.Current.ElapsedMs(_coverageThrottleTimestamp, now) >= COVERAGE_CHECK_INTERVAL_MS)
-        {
-            _coverageCacheValid = false;
-            _coverageThrottleTimestamp = now;
-        }
-
-        // Update each section
+        // Update each section. During slow-speed cutoff, Auto sections were
+        // already cleared above; skip them here so UpdateSection's look-ahead
+        // doesn't re-arm SectionOnRequest at speed=0 (lookOnDist collapses to
+        // the section center, which evaluates as shouldBeOn inside the
+        // boundary, leaving the section pinned in TURNING_ON forever).
         for (int i = 0; i < numSections; i++)
         {
+            if (isSlowSpeedCutoff && _sectionStates[i].ButtonState == SectionButtonState.Auto)
+                continue;
             UpdateSection(i, toolPosition, toolHeading, speed);
         }
-
-        // Mark coverage cache as valid for next frame (until throttle timer expires)
-        _coverageCacheValid = true;
 
         // Flush coverage updates after all sections processed (fires event once, not 16 times)
         _coverageMapService.FlushCoverageUpdate();
@@ -293,15 +328,21 @@ public class SectionControlService : ISectionControlService
             return;
         }
 
-        // Auto mode - check boundary/overlap conditions
-        // Look-ahead distances match the TURNING_ON / TURNING_OFF phase duration
-        // (max(SECTION_ON_DELAY, LookAheadOn) for ON; max(1, LookAheadOff) for OFF).
-        // The phase delay exactly cancels the projection, so the physical IsOn flip
-        // lines up with the slit edge regardless of LookAhead settings.
-        double turnOnPhaseSec = Math.Max(SECTION_ON_DELAY * 0.1, tool.LookAheadOnSetting);
-        double turnOffPhaseSec = Math.Max(0.1, tool.LookAheadOffSetting);
-        double lookAheadOnDist = speed * turnOnPhaseSec;
-        double lookAheadOffDist = speed * turnOffPhaseSec;
+        // Auto mode - check boundary/overlap conditions.
+        // Look-ahead distances and TURNING_ON / TURNING_OFF phase durations
+        // come straight from user config. The phase delay exactly cancels the
+        // projection, so the physical IsOn flip lands on the boundary edge.
+        // With both settings at 0, no anticipation and no wait — section
+        // flips on the first tick that shouldBe(On|Off) becomes true.
+        double turnOnPhaseSec = tool.LookAheadOnSetting;
+        double turnOffPhaseSec = tool.LookAheadOffSetting;
+        // Floor the FORWARD distance only (the time-based phase debounce above
+        // stays at user config). This keeps the sample point past the section's
+        // own swath at slow speed; at normal speeds speed × time exceeds the
+        // floor and the user's anticipation is preserved exactly. See the
+        // MIN_LOOKAHEAD_FORWARD_DISTANCE_METERS comment for the full reason.
+        double lookAheadOnDist = Math.Max(speed * turnOnPhaseSec, MIN_LOOKAHEAD_FORWARD_DISTANCE_METERS);
+        double lookAheadOffDist = Math.Max(speed * turnOffPhaseSec, MIN_LOOKAHEAD_FORWARD_DISTANCE_METERS);
 
         // Calculate section half-width for segment-based checks
         double halfWidth = (section.PositionRight - section.PositionLeft) / 2.0;
@@ -334,62 +375,58 @@ public class SectionControlService : ISectionControlService
         bool lookOffInBoundary = lookOffBoundaryResult.InsidePercent >= BOUNDARY_THRESHOLD_LOOKAHEAD;
 
         // Check headland conditions
-        // Use speed-dependent look-ahead so coverage triangles extend INTO headland consistently
-        // The look-ahead compensates for MAPPING_ON_DELAY (vehicle travels during the delay)
-        // Formula: lookAhead = targetPenetration + speed * delayTime
-        const double TARGET_PENETRATION = 0.30;  // Target: first coverage point 30cm into headland
-        const double MAPPING_DELAY_SECONDS = 0.2; // MAPPING_ON_DELAY = 2 cycles at 10Hz
-        double headlandOnLookAhead = TARGET_PENETRATION + speed * MAPPING_DELAY_SECONDS;
+        // Use speed-dependent look-ahead so coverage edges land exactly on
+        // the headland line. The look-ahead distance must cancel the wait
+        // time between shouldBeOn/Off and the actual IsOn flip:
+        //   ON:  lookahead = speed * turnOnPhaseSec  (cancels TURNING_ON wait)
+        //   OFF: lookahead = speed * turnOffPhaseSec (cancels TURNING_OFF wait)
+        // With MAPPING_ON_DELAY = 0, the TURNING phases are the only wait,
+        // so this gives strip start/end at the line with no gap and no
+        // overspray when all timings are 0.
+        double headlandOnLookAhead = speed * turnOnPhaseSec;
+        double headlandOffLookAhead = speed * turnOffPhaseSec;
         var headlandOnCheckPoint = ProjectForwardCurved(sectionCenter, toolHeading, headlandOnLookAhead, speed);
+        var headlandOffCheckPoint = ProjectForwardCurved(sectionCenter, toolHeading, headlandOffLookAhead, speed);
 
         _sectionSw.Restart();
         bool isInHeadland = IsPointInHeadland(sectionCenter);
-        bool lookAheadInHeadland = IsPointInHeadland(headlandOnCheckPoint);
+        bool lookOnInHeadland = IsPointInHeadland(headlandOnCheckPoint);
+        bool lookOffInHeadland = IsPointInHeadland(headlandOffCheckPoint);
         _totalHeadlandMs += _sectionSw.Elapsed.TotalMilliseconds;
 
-        // For ON: use speed-adjusted look-ahead so triangle extends ~30cm into headland at any speed
-        // For OFF: use current position so we stop AFTER entering headland (last point in headland)
-        bool lookOnInHeadland = lookAheadInHeadland;  // Turn ON when look-ahead exits headland
-        bool lookOffInHeadland = isInHeadland;        // Turn OFF when current pos enters headland
+        // Bitmap-based coverage check is O(width / cellSize) bit reads per section
+        // (~80 reads for an 8 m boom at 10 cm cells). Cheap enough to run every tick;
+        // the prior 150 ms throttle was a holdover from polygon-based coverage and
+        // produced 15 ticks of stale-cache lag at 100 Hz, leaving a visible gap when
+        // exiting previously-covered area (section stays cached-OFF past the edge).
+        _sectionSw.Restart();
+        var (currentCoverage, lookOnCoverage, lookOffCoverage) = _coverageMapService.GetSegmentCoverageMulti(
+            sectionCenter,
+            toolHeading,
+            halfWidth,
+            lookAheadOnDist,
+            lookAheadOffDist);
+        _totalCoverageMs += _sectionSw.Elapsed.TotalMilliseconds;
 
-        // Check coverage using segment-based detection (throttled for performance)
-        // This checks the entire section width, not just center point
-        CoverageResult currentCoverage, lookOnCoverage, lookOffCoverage;
-
-        if (_coverageCacheValid && index < _cachedCurrentCoverage.Length)
-        {
-            // Use cached results
-            currentCoverage = _cachedCurrentCoverage[index];
-            lookOnCoverage = _cachedLookOnCoverage[index];
-            lookOffCoverage = _cachedLookOffCoverage[index];
-        }
-        else
-        {
-            // Perform actual coverage check
-            _sectionSw.Restart();
-            (currentCoverage, lookOnCoverage, lookOffCoverage) = _coverageMapService.GetSegmentCoverageMulti(
-                sectionCenter,
-                toolHeading,
-                halfWidth,
-                lookAheadOnDist,
-                lookAheadOffDist);
-            _totalCoverageMs += _sectionSw.Elapsed.TotalMilliseconds;
-
-            // Cache results
-            if (index < _cachedCurrentCoverage.Length)
-            {
-                _cachedCurrentCoverage[index] = currentCoverage;
-                _cachedLookOnCoverage[index] = lookOnCoverage;
-                _cachedLookOffCoverage[index] = lookOffCoverage;
-            }
-        }
-
-        // Section is "covered" if coverage exceeds threshold
-        // Use MinCoverage setting from config (0-100), default to 70% if not set
-        double coverageThreshold = tool.MinCoverage > 0 ? tool.MinCoverage / 100.0 : DEFAULT_COVERAGE_THRESHOLD;
-        bool currentCovered = currentCoverage.CoveragePercent >= coverageThreshold;
-        bool lookOnCovered = lookOnCoverage.CoveragePercent >= coverageThreshold;
-        bool lookOffCovered = lookOffCoverage.CoveragePercent >= coverageThreshold;
+        // The ON and OFF decisions use different thresholds — by design, not
+        // for noise hysteresis (the #345 explicit margin is gone, replaced
+        // by the natural separation below).
+        //   ON threshold = MinCoverage. User's "I want X % overlap" setting
+        //     gates turning the section on: don't bother firing if the look-
+        //     ahead area is already at or above the user's accepted overlap.
+        //   OFF threshold = COVERAGE_OFF_THRESHOLD (≈ 1.0). Section stays on
+        //     while ANY meaningful cell in its swath is uncovered, so a pass
+        //     over a partly-painted strip fills the gaps (#348). Per-cell
+        //     idempotency in MarkCellCovered handles the already-covered
+        //     cells without over-paint. The natural separation between this
+        //     and the ON threshold (≈ 30 points at default MinCoverage) is
+        //     the hysteresis that prevents slow-speed flicker (#345).
+        double coverageOnThreshold = tool.MinCoverage > 0
+            ? tool.MinCoverage / 100.0
+            : DEFAULT_COVERAGE_THRESHOLD;
+        double coverageOffThreshold = COVERAGE_OFF_THRESHOLD;
+        bool lookOnCovered = lookOnCoverage.CoveragePercent >= coverageOnThreshold;
+        bool lookOffCovered = lookOffCoverage.CoveragePercent >= coverageOffThreshold;
 
         // Store coverage percentage for potential UI display
         section.CoveragePercent = currentCoverage.CoveragePercent;
@@ -451,13 +488,18 @@ public class SectionControlService : ISectionControlService
             section.SectionOnTimer++;
             section.SectionOffTimer = 0;
 
-            // TURNING_ON phase models the valve open time. Coverage is NOT
-            // applied during this phase (valve opening, no fluid yet). Phase
-            // duration = LookAheadOnSetting (configured actuator open time)
-            // with a SECTION_ON_DELAY minimum for software debounce.
-            int turnOnPhaseFrames = Math.Max(SECTION_ON_DELAY, (int)(tool.LookAheadOnSetting * 10));
+            // TURNING_ON phase: duration must match the look-ahead anticipation
+            // (turnOnPhaseSec, in seconds, computed above) so the projection
+            // exactly cancels the phase delay and the physical IsOn flip lands
+            // on the boundary edge. Derive ticks from the same seconds value
+            // — *not* from LookAheadOnSetting alone — otherwise the floor
+            // (SECTION_ON_DELAY_SECONDS) doesn't carry into the wait time.
+            // Use >= so the flip happens on the tick that completes the
+            // debounce; > would add one extra tick of wait (visible as a
+            // tick-period of late spray at any tick rate).
+            int turnOnPhaseTicks = Math.Max(1, (int)Math.Round(turnOnPhaseSec * TickHz));
 
-            if (section.SectionOnTimer > turnOnPhaseFrames)
+            if (section.SectionOnTimer >= turnOnPhaseTicks)
             {
                 section.IsOn = true;
                 section.SectionOnRequest = false;
@@ -479,10 +521,11 @@ public class SectionControlService : ISectionControlService
             // spray stops at the intended position.
             UpdateMapping(index, leftEdge, rightEdge, toolHeading);
 
-            int turnOffPhaseFrames = (int)(tool.LookAheadOffSetting * 10);
-            if (turnOffPhaseFrames < 1) turnOffPhaseFrames = 1;
+            // Same as ON: derive ticks from turnOffPhaseSec and use >= so the
+            // OFF flip lands at the intended position instead of one tick past.
+            int turnOffPhaseTicks = Math.Max(1, (int)Math.Round(turnOffPhaseSec * TickHz));
 
-            if (section.SectionOffTimer > turnOffPhaseFrames)
+            if (section.SectionOffTimer >= turnOffPhaseTicks)
             {
                 section.IsOn = false;
                 section.SectionOffRequest = false;
@@ -491,16 +534,28 @@ public class SectionControlService : ISectionControlService
         }
         else if (section.IsOn)
         {
-            // Section is on and should stay on - update mapping
+            // Section is on and should stay on - update mapping.
+            // Clear any stale request flags from a prior tick so the section
+            // doesn't render as "Turning OFF" (cyan, code 3) after a transient
+            // shouldBeOff flicker that didn't accumulate enough timer ticks
+            // to actually flip IsOn. Without this, SectionOffRequest sticks
+            // true forever and the UI shows code 3 indefinitely.
             section.SectionOnTimer = 0;
             section.SectionOffTimer = 0;
+            section.SectionOnRequest = false;
+            section.SectionOffRequest = false;
             UpdateMapping(index, leftEdge, rightEdge, toolHeading);
         }
         else
         {
-            // Section is off and should stay off
+            // Section is off and should stay off. Same reasoning as the
+            // steady-on branch: clear any stale SectionOnRequest from a
+            // transient shouldBeOn flicker so the section doesn't render
+            // as "Turning ON" (orange, code 4) indefinitely.
             section.SectionOnTimer = 0;
             section.SectionOffTimer = 0;
+            section.SectionOnRequest = false;
+            section.SectionOffRequest = false;
 
             // Keep ticking the StopMapping debounce while mapping is still
             // active — same reasoning as UpdateSectionOff. The shouldBeOff
@@ -553,8 +608,15 @@ public class SectionControlService : ISectionControlService
         {
             UpdateMapping(index, leftEdge, rightEdge, toolHeading);
         }
+        // Clear timers AND request flags. Without clearing the requests,
+        // a section that switches Auto -> Manual On while a SectionOffRequest
+        // was pending would carry that flag forever; the ButtonState=On
+        // path of GetSectionColorCode masks it as code 1 (yellow), but the
+        // dirty state shows up the moment the user flips back to Auto.
         section.SectionOnTimer = 0;
         section.SectionOffTimer = 0;
+        section.SectionOnRequest = false;
+        section.SectionOffRequest = false;
     }
 
     /// <summary>
@@ -565,7 +627,7 @@ public class SectionControlService : ISectionControlService
         var section = _sectionStates[index];
         section.MappingOnTimer++;
 
-        if (section.MappingOnTimer > MAPPING_ON_DELAY && !section.IsMappingOn)
+        if (section.MappingOnTimer > MappingOnDelayTicks && !section.IsMappingOn)
         {
             section.IsMappingOn = true;
             section.MappingOnTimer = 0;
@@ -700,7 +762,7 @@ public class SectionControlService : ISectionControlService
         var section = _sectionStates[index];
         section.MappingOffTimer++;
 
-        if (section.MappingOffTimer > MAPPING_OFF_DELAY && section.IsMappingOn)
+        if (section.MappingOffTimer > MappingOffDelayTicks && section.IsMappingOn)
         {
             section.IsMappingOn = false;
             section.MappingOffTimer = 0;
@@ -827,7 +889,21 @@ public class SectionControlService : ISectionControlService
     {
         var boundary = _state.Field.CurrentBoundary;
         if (boundary == null || !boundary.IsValid)
-            return BoundaryResult.FullyInside; // No boundary = always in
+        {
+            // No usable boundary. Two cases:
+            //  • A field IS open but has no boundary yet (#419): Auto must
+            //    still work — coverage drives on/off so sections turn off
+            //    when crossing previously-applied area while free driving.
+            //    Treat every section as fully inside so the boundary gate is
+            //    a no-op and the coverage check is the only authority.
+            //  • No field open at all (#347): spraying with no field defined
+            //    is never intended (AiO firmware enforces the same), so treat
+            //    every section as fully outside, which gates Auto off and
+            //    forces IsOn=false via the strict isInBoundary check.
+            return _state.Field.HasActiveField
+                ? BoundaryResult.FullyInside
+                : BoundaryResult.FullyOutside;
+        }
 
         return boundary.GetSegmentBoundaryStatus(sectionCenter, heading, halfWidth);
     }
@@ -862,7 +938,7 @@ public class SectionControlService : ISectionControlService
 
     public (Vec2 left, Vec2 right) GetSectionWorldPosition(int sectionIndex, Vec3 toolPosition, double toolHeading)
     {
-        if (sectionIndex < 0 || sectionIndex >= 16)
+        if (sectionIndex < 0 || sectionIndex >= _sectionStates.Length)
             return (new Vec2(0, 0), new Vec2(0, 0));
 
         var section = _sectionStates[sectionIndex];
@@ -885,7 +961,7 @@ public class SectionControlService : ISectionControlService
 
     public void SetSectionState(int sectionIndex, SectionButtonState state)
     {
-        if (sectionIndex < 0 || sectionIndex >= 16) return;
+        if (sectionIndex < 0 || sectionIndex >= _sectionStates.Length) return;
 
         _sectionStates[sectionIndex].ButtonState = state;
 
@@ -911,7 +987,7 @@ public class SectionControlService : ISectionControlService
 
     public void SetAllSections(SectionButtonState state)
     {
-        for (int i = 0; i < 16; i++)
+        for (int i = 0; i < _sectionStates.Length; i++)
         {
             _sectionStates[i].ButtonState = state;
 
@@ -935,7 +1011,7 @@ public class SectionControlService : ISectionControlService
 
     public void TurnAllOff()
     {
-        for (int i = 0; i < 16; i++)
+        for (int i = 0; i < _sectionStates.Length; i++)
         {
             UpdateSectionOff(i);
         }
@@ -959,13 +1035,11 @@ public class SectionControlService : ISectionControlService
     }
 
     /// <summary>
-    /// Invalidate the coverage check cache, forcing a fresh query on the next Update.
-    /// Useful in tests where wall-clock time doesn't advance between frames.
+    /// No-op since the per-tick cache was removed; coverage is now queried
+    /// every Update directly. Kept for backwards compatibility with tests
+    /// that explicitly invalidated the old cache between frames.
     /// </summary>
-    public void InvalidateCoverageCache()
-    {
-        _coverageCacheValid = false;
-    }
+    public void InvalidateCoverageCache() { }
 
     public void RecalculateSectionPositions()
     {
@@ -991,7 +1065,7 @@ public class SectionControlService : ISectionControlService
         }
 
         // Clear positions for unused sections
-        for (int i = numSections; i < 16; i++)
+        for (int i = numSections; i < _sectionStates.Length; i++)
         {
             _sectionStates[i].PositionLeft = 0;
             _sectionStates[i].PositionRight = 0;
@@ -1006,6 +1080,25 @@ public class SectionControlService : ISectionControlService
             if (_sectionStates[i].IsOn)
             {
                 bits |= (ushort)(1 << i);
+            }
+        }
+        return bits;
+    }
+
+    /// <summary>
+    /// Section on/off as a 64-bit mask (sections 1–64 in bits 0–63). The low
+    /// 16 bits match <see cref="GetSectionBits"/>. Used to build PGN 229 when
+    /// more than 16 sections are configured.
+    /// </summary>
+    public ulong GetSectionBits64()
+    {
+        ulong bits = 0;
+        int count = Math.Min(_sectionStates.Length, ToolConfig.MaxSections);
+        for (int i = 0; i < count; i++)
+        {
+            if (_sectionStates[i].IsOn)
+            {
+                bits |= 1UL << i;
             }
         }
         return bits;

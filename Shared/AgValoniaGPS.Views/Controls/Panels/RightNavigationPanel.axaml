@@ -30,14 +30,17 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
     <UserControl.Resources>
         <converters:InverseBoolConverter x:Key="InverseBoolConverter"/>
+        <converters:BoolToStringConverter x:Key="BoolToStringConverter"/>
     </UserControl.Resources>
 
     <UserControl.Styles>
         <!-- Floating Panel Style -->
         <Style Selector="Border.FloatingPanel">
             <Setter Property="Background" Value="{DynamicResource SystemControlBackgroundChromeMediumBrush}"/>
-            <Setter Property="CornerRadius" Value="12"/>
-            <Setter Property="Padding" Value="8"/>
+            <Setter Property="CornerRadius" Value="0"/>
+            <!-- Outer (right) padding removed so the buttons sit flush to the right
+                 window edge; inner (left/top/bottom) gaps preserved. -->
+            <Setter Property="Padding" Value="8,8,0,8"/>
             <Setter Property="BorderBrush" Value="{DynamicResource SystemControlForegroundBaseLowBrush}"/>
             <Setter Property="BorderThickness" Value="1"/>
         </Style>
@@ -45,7 +48,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
         <!-- Right Panel Button Style -->
         <Style Selector="Button.RightPanelButton">
             <Setter Property="Background" Value="{DynamicResource SystemControlBackgroundBaseLowBrush}"/>
-            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="CornerRadius" Value="0"/>
             <Setter Property="Width" Value="64"/>
             <Setter Property="Height" Value="64"/>
             <Setter Property="Padding" Value="8"/>
@@ -75,8 +78,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
         </Style>
     </UserControl.Styles>
 
-    <!-- Navigation Button Bar -->
-    <Border x:Name="MainPanel" Classes="FloatingPanel">
+    <!-- Navigation Button Bar.
+         Hidden whenever no field/job is open — no buttons do anything in that state. -->
+    <Border x:Name="MainPanel" Classes="FloatingPanel"
+            IsVisible="{Binding IsFieldOpen}">
         <StackPanel x:Name="ButtonStack" Spacing="6" Orientation="Vertical">
             <!-- 1. Contour/Track Mode Toggle -->
             <Button Classes="RightPanelButton" ToolTip.Tip="Contour Mode On/Off"
@@ -90,8 +95,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
             </Button>
 
             <!-- 2. Manual Mode Toggle - All sections Manual On/Off -->
+            <!-- Available as soon as a field is open. Manual section control is
+                 a valid workflow with no boundary: operator drives AB lines and
+                 taps sections on/off themselves. -->
             <Button Classes="RightPanelButton" ToolTip.Tip="All Sections Manual On/Off"
-                    Command="{Binding ToggleManualModeCommand}">
+                    Command="{Binding ToggleManualModeCommand}"
+                    IsVisible="{Binding IsFieldOpen}">
                 <Panel>
                     <Image Source="avares://AgValoniaGPS.Views/Assets/Icons/ManualOn.png" Stretch="Uniform"
                            IsVisible="{Binding IsManualSectionMode}"/>
@@ -101,8 +110,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
             </Button>
 
             <!-- 3. Section Master Toggle - All sections Auto/Off -->
+            <!-- Available as soon as a field is open (#419). Auto section
+                 control is valid with no boundary: coverage alone drives
+                 on/off, so sections turn off when crossing previously-applied
+                 area while free driving. A boundary just adds boundary/headland
+                 gating on top when one exists. -->
             <Button Classes="RightPanelButton" ToolTip.Tip="All Sections Auto/Off"
-                    Command="{Binding ToggleSectionMasterCommand}">
+                    Command="{Binding ToggleSectionMasterCommand}"
+                    IsVisible="{Binding IsFieldOpen}">
                 <Panel>
                     <Image Source="avares://AgValoniaGPS.Views/Assets/Icons/SectionMasterOn.png" Stretch="Uniform"
                            IsVisible="{Binding IsSectionMasterOn}"/>
@@ -111,10 +126,18 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
                 </Panel>
             </Button>
 
-            <!-- 4. YouTurn Toggle (visible when track active AND UTurn button enabled in config) -->
+            <!-- 4. YouTurn Toggle (auto U-Turn arming).
+                 Requires a boundary because auto U-turn needs a headland and
+                 outer-boundary geometry. Manual U-turn buttons (#4b) remain
+                 available without a boundary. -->
             <Button Classes="RightPanelButton" ToolTip.Tip="YouTurn Auto U-Turn"
-                    Command="{Binding ToggleYouTurnCommand}"
-                    IsVisible="{Binding IsUTurnButtonVisible}">
+                    Command="{Binding ToggleYouTurnCommand}">
+                <Button.IsVisible>
+                    <MultiBinding Converter="{x:Static BoolConverters.And}">
+                        <Binding Path="IsUTurnButtonVisible"/>
+                        <Binding Path="HasBoundary"/>
+                    </MultiBinding>
+                </Button.IsVisible>
                 <Panel>
                     <Image Source="avares://AgValoniaGPS.Views/Assets/Icons/YouTurnYes.png" Stretch="Uniform"
                            IsVisible="{Binding IsYouTurnEnabled}"/>
@@ -123,8 +146,45 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
                 </Panel>
             </Button>
 
-            <!-- 4b. Manual U-Turn Left/Right buttons (only visible when autosteer engaged) -->
-            <Grid ColumnDefinitions="*,*" IsVisible="{Binding IsAutoSteerEngaged}">
+            <!-- 4a. U-Turn Direction Toggle + Distance to trigger.
+                 Mirrors legacy AgOpenGPS UTurn button (FormGPS DrawUTurnBtn / SwapDirection):
+                 single tap-target showing the armed direction arrow with distance underneath.
+                 Same boundary gating as #4 — only meaningful when auto-uturn is active. -->
+            <Button Classes="RightPanelButton" Width="64" Height="64"
+                    ToolTip.Tip="Toggle U-Turn direction"
+                    Command="{Binding ToggleUTurnDirectionCommand}">
+                <Button.IsVisible>
+                    <MultiBinding Converter="{x:Static BoolConverters.And}">
+                        <Binding Path="IsUTurnButtonVisible"/>
+                        <Binding Path="HasBoundary"/>
+                    </MultiBinding>
+                </Button.IsVisible>
+                <Grid RowDefinitions="*,Auto" Margin="2">
+                    <!-- Direction arrow.
+                         When armed: bind to State.YouTurn.IsTurnLeft.
+                         When idle: bind to NextUTurnDirectionLeftOverride. -->
+                    <Panel Grid.Row="0" HorizontalAlignment="Center" VerticalAlignment="Center">
+                        <TextBlock FontSize="26"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}"
+                                   IsVisible="{Binding State.YouTurn.IsTriggered}"
+                                   Text="{Binding State.YouTurn.IsTurnLeft, Converter={StaticResource BoolToStringConverter}, ConverterParameter=↰|↱}"/>
+                        <TextBlock FontSize="26"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}"
+                                   IsVisible="{Binding State.YouTurn.IsTriggered, Converter={StaticResource InverseBoolConverter}}"
+                                   Text="{Binding NextUTurnDirectionLeftOverride, Converter={StaticResource BoolToStringConverter}, ConverterParameter=↰|↱}"/>
+                    </Panel>
+                    <TextBlock Grid.Row="1"
+                               FontSize="11"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Bottom"
+                               Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}"
+                               Text="{Binding State.YouTurn.DistanceToTrigger, StringFormat={}{0:F0} m}"
+                               IsVisible="{Binding IsUTurnDistanceVisible}"/>
+                </Grid>
+            </Button>
+
+            <!-- 4b. Manual U-Turn Left/Right buttons (visible when steering, hidden on polygon tracks #421) -->
+            <Grid ColumnDefinitions="*,*" IsVisible="{Binding IsManualUTurnVisible}">
                 <Button Grid.Column="0" Classes="RightPanelButton" Width="30" Height="32"
                         ToolTip.Tip="Manual U-Turn Left"
                         Command="{Binding ManualYouTurnLeftCommand}"

@@ -3,8 +3,8 @@
 // Version format: YY.major.patch (Apple-style, year-based)
 
 #define VERSION_MAJOR 26
-#define VERSION_MINOR 4
-#define VERSION_PATCH 65
+#define VERSION_MINOR 5
+#define VERSION_PATCH 41
 
-#define VERSION "26.4.65"
-#define VERSION_DATE "2026-04-29"
+#define VERSION "26.5.41"
+#define VERSION_DATE "2026-06-06"
