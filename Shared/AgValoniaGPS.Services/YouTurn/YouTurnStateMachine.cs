@@ -60,15 +60,18 @@ public sealed class YouTurnStateMachine
     private readonly YouTurnCreationService _creation;
     private readonly YouTurnPathingService _pathing;
     private readonly ILogger<YouTurnStateMachine> _logger;
+    private readonly ConfigurationStore _configStore;
 
     public YouTurnStateMachine(
         YouTurnCreationService creation,
         YouTurnPathingService pathing,
-        ILogger<YouTurnStateMachine> logger)
+        ILogger<YouTurnStateMachine> logger,
+        ConfigurationStore configStore)
     {
         _creation = creation;
         _pathing = pathing;
         _logger = logger;
+        _configStore = configStore;
     }
 
     /// <summary>
@@ -473,7 +476,7 @@ public sealed class YouTurnStateMachine
         }
         else
         {
-            effects.StatusMessage = "Not enough room — turn would leave the field";
+            effects.StatusMessage = "Not enough room — turn would put the tool past the boundary";
         }
 
         return effects;
@@ -518,7 +521,7 @@ public sealed class YouTurnStateMachine
             return;
         }
 
-        var config = ConfigurationStore.Instance;
+        var config = _configStore;
         double widthMinusOverlap = config.ActualToolWidth - config.Tool.Overlap;
         double nextDistAway = widthMinusOverlap * nextPath.Value;
         int pathDiff = nextPath.Value - guidance.HowManyPathsAway;
@@ -552,7 +555,11 @@ public sealed class YouTurnStateMachine
         }
         else
         {
-            var offsetPoints = CurveProcessing.CreateOffsetCurve(track.Points, nextDistAway);
+            // Offset then EXTEND the ends so the cyan next-track curve matches the
+            // exit leg and the post-turn magenta line (no gap at the exit handoff).
+            // Mirrors YouTurnPathingService.ComputeNextTrack; no-op on closed loops.
+            var offsetPoints = CurveProcessing.ExtendCurveEnds(
+                CurveProcessing.CreateOffsetCurve(track.Points, nextDistAway));
             turn.NextTrack = Models.Track.Track.FromCurve($"Path {nextPath.Value}", offsetPoints, track.IsClosed);
         }
         turn.NextTrack.IsActive = false;
@@ -630,6 +637,9 @@ public sealed class YouTurnStateMachine
             guidance, turn,
             ctx.UTurnSkipRows, ctx.HeadlandCalculatedWidth, ctx.HeadlandDistance);
 
+        if (result.ClearanceBlocked && effects.StatusMessage == null)
+            effects.StatusMessage = "U-turn blocked: implement would swing into a hard boundary — take over manually.";
+
         if (result.Path == null) return;
 
         turn.TurnPath = result.Path;
@@ -653,7 +663,7 @@ public sealed class YouTurnStateMachine
             return;
         }
 
-        var config = ConfigurationStore.Instance;
+        var config = _configStore;
 
         if (turn.ReturnPassTargetPath.HasValue)
         {

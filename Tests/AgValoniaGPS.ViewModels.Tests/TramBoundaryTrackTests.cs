@@ -22,7 +22,7 @@ public class TramBoundaryTrackTests
     {
         var offsetService = new TramLineOffsetService();
         var logger = NullLogger<TramLineService>.Instance;
-        _service = new TramLineService(offsetService, logger);
+        _service = new TramLineService(offsetService, logger, ConfigurationStore.Instance);
 
         ConfigurationStore.Instance.Tram.TramWidth = 24.0;
         ConfigurationStore.Instance.Vehicle.TrackWidth = 1.8;
@@ -430,9 +430,7 @@ public class TramBoundaryTrackTests
             }
         };
         bndModel.OuterBoundary.UpdateBounds();
-        typeof(MainViewModel).GetField("_currentBoundary",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
-            .SetValue(vm, bndModel);
+        vm.State.Field.CurrentBoundary = bndModel;
 
         var seg = new AgValoniaGPS.Models.Headland.HeadlandSegment
         {
@@ -475,9 +473,7 @@ public class TramBoundaryTrackTests
             }
         };
         bndModel.OuterBoundary.UpdateBounds();
-        typeof(MainViewModel).GetField("_currentBoundary",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
-            .SetValue(vm, bndModel);
+        vm.State.Field.CurrentBoundary = bndModel;
 
         var seg = new AgValoniaGPS.Models.Headland.HeadlandSegment
         {
@@ -529,9 +525,7 @@ public class TramBoundaryTrackTests
             }
         };
         bndModel.OuterBoundary.UpdateBounds();
-        typeof(MainViewModel).GetField("_currentBoundary",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
-            .SetValue(vm, bndModel);
+        vm.State.Field.CurrentBoundary = bndModel;
 
         var seg = new AgValoniaGPS.Models.Headland.HeadlandSegment
         {

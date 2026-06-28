@@ -40,13 +40,15 @@ public class OffsetFixScreenshotTests
         config.Tool.IsToolTBT = false;
         config.Tool.Width = 6.0;
 
-        var toolService = new AgValoniaGPS.Services.Tool.ToolPositionService();
+        var toolService = new AgValoniaGPS.Services.Tool.ToolPositionService(
+            AgValoniaGPS.Models.Configuration.ConfigurationStore.Instance);
 
+        // Grid visibility is sourced from ConfigStore.Display.GridVisible (the SoT).
+        AgValoniaGPS.Models.Configuration.ConfigurationStore.Instance.Display.GridVisible = true;
         var mapControl = new SkiaMapControl
         {
             Width = 600,
-            Height = 600,
-            IsGridVisible = true
+            Height = 600
         };
 
         // Set boundary: 40m square centered at (0, 0)
