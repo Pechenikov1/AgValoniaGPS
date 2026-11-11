@@ -52,6 +52,7 @@ public partial class MainViewModel : ObservableObject
     private readonly AgValoniaGPS.Services.Interfaces.IGpsService _gpsService;
     private readonly IFieldService _fieldService;
     private readonly INtripClientService _ntripService;
+    private readonly IUiDispatcher _dispatcher;
     private readonly AgValoniaGPS.Services.Interfaces.IDisplaySettingsService _displaySettings;
     private readonly AgValoniaGPS.Services.Interfaces.IFieldStatisticsService _fieldStatistics;
     private readonly AgValoniaGPS.Services.Interfaces.IGpsSimulationService _simulatorService;
@@ -93,19 +94,21 @@ public partial class MainViewModel : ObservableObject
     private readonly IPipelineIntents _intents;
     private readonly ILogger<MainViewModel> _logger;
     private readonly ApplicationState _appState;
-    private readonly Avalonia.Threading.DispatcherTimer _simulatorTimer;
-    private Avalonia.Threading.DispatcherTimer? _renderPullTimer;
+    private readonly ConfigurationStore _configStore;
+    private readonly IUiTimerFactory _timerFactory;
+    private readonly IUiTimer _simulatorTimer;
+    private IUiTimer? _renderPullTimer;
     // PERF-05 Phase 2c #2: unified 5 Hz status-display tick, decoupled from
     // every data source (GPS 10 Hz, control loop 100 Hz, AutoSteer 100 Hz).
     // Drives every MainViewModel property bound to the top status bar.
-    private Avalonia.Threading.DispatcherTimer? _statusTickTimer;
+    private IUiTimer? _statusTickTimer;
 
     /// <summary>
     /// Centralized application state - single source of truth for all runtime state.
     /// Use this for new code. Existing properties will gradually migrate to use State.
     /// </summary>
     public ApplicationState State => _appState;
-    public DisplayConfig Display => ConfigurationStore.Instance.Display;
+    public DisplayConfig Display => _configStore.Display;
 
     /// <summary>
     /// Persistent application state — window/last-view/last-field/sim position
@@ -115,24 +118,19 @@ public partial class MainViewModel : ObservableObject
     /// </summary>
     public PersistentAppState PersistentState => PersistentAppState.Instance;
 
-    // Convenience accessors for ConfigurationStore (replaces _vehicleConfig usage)
-    private static ConfigurationStore ConfigStore => ConfigurationStore.Instance;
-    private static VehicleConfig Vehicle => ConfigurationStore.Instance.Vehicle;
-    private static ToolConfig Tool => ConfigurationStore.Instance.Tool;
-    private static GuidanceConfig Guidance => ConfigurationStore.Instance.Guidance;
-
-    // Current field origin (for map centering when GPS not active)
-    private double _fieldOriginLatitude;
-    private double _fieldOriginLongitude;
+    // Convenience accessors for the injected ConfigurationStore (§11.2 — no
+    // ambient _configStore access in the VM/services).
+    private ConfigurationStore ConfigStore => _configStore;
+    private VehicleConfig Vehicle => _configStore.Vehicle;
+    private ToolConfig Tool => _configStore.Tool;
+    private GuidanceConfig Guidance => _configStore.Guidance;
 
     /// <summary>
-    /// Sets the field origin and propagates it into centralized FieldState so
-    /// non-ViewModel consumers (map control, services) can read the LocalPlane.
+    /// Sets the field origin in centralized FieldState — the single home (§12.1) —
+    /// so all consumers (VM, map control, services) read State.Field.Origin*.
     /// </summary>
     private void SetFieldOrigin(double latitude, double longitude)
     {
-        _fieldOriginLatitude = latitude;
-        _fieldOriginLongitude = longitude;
         _simulatorLocalPlane = null;
 
         State.Field.OriginLatitude = latitude;
@@ -155,9 +153,7 @@ public partial class MainViewModel : ObservableObject
 
     // Guidance/Steering status
     private double _crossTrackError;
-    private string _currentGuidanceLine = "1L";
     private bool _isAutoSteerActive;
-    private int _activeSections;
 
     // Hello status (connection health)
     private bool _isAutoSteerHelloOk;
@@ -180,7 +176,6 @@ public partial class MainViewModel : ObservableObject
     private double _hitchNorthing;
 
     // Field properties
-    private Field? _activeField;
     private string _fieldsRootDirectory = string.Empty;
 
     public MainViewModel(
@@ -222,14 +217,20 @@ public partial class MainViewModel : ObservableObject
         IPipelineIntents intents,
         ILogger<MainViewModel> logger,
         ApplicationState appState,
+        ConfigurationStore configStore,
         IPersistentStateService persistentStateService,
         IBatteryService batteryService,
+        IUiDispatcher uiDispatcher,
+        IUiTimerFactory uiTimerFactory,
         ISteerMachineLoopService? controlLoop = null,
         IPositionEstimator? positionEstimator = null)
     {
         _logger = logger;
+        _configStore = configStore;
         _persistentStateService = persistentStateService;
         _batteryService = batteryService;
+        _dispatcher = uiDispatcher;
+        _timerFactory = uiTimerFactory;
         _tramLineService = tramLineService;
 
         // Battery icon in the strip — start the per-platform reader, prime with
@@ -273,12 +274,18 @@ public partial class MainViewModel : ObservableObject
         {
             if (e.PropertyName == nameof(Models.Configuration.DisplayConfig.UTurnButtonVisible))
             {
-                OnPropertyChanged(nameof(IsUTurnButtonVisible));
                 OnPropertyChanged(nameof(IsUTurnOverlayVisible));
             }
             else if (e.PropertyName == nameof(Models.Configuration.DisplayConfig.LateralButtonVisible))
             {
                 OnPropertyChanged(nameof(IsLateralOverlayVisible));
+            }
+            else if (e.PropertyName == nameof(Models.Configuration.DisplayConfig.GridVisible))
+            {
+                // The renderer reads ConfigStore.Display.GridVisible directly; keep the
+                // on-screen grid button's active-state binding in sync when the flag is
+                // flipped from the Settings/Screen-&-Alerts toggle instead of the button.
+                OnPropertyChanged(nameof(IsGridOn));
             }
         };
 
@@ -415,10 +422,8 @@ public partial class MainViewModel : ObservableObject
             // ~20 Hz on mobile to give the composition thread headroom; desktop
             // keeps 30 Hz for smoother vehicle interpolation.
             int intervalMs = (OperatingSystem.IsIOS() || OperatingSystem.IsAndroid()) ? 50 : 33;
-            _renderPullTimer = new Avalonia.Threading.DispatcherTimer
-            {
-                Interval = TimeSpan.FromMilliseconds(intervalMs),
-            };
+            _renderPullTimer = _timerFactory.Create();
+            _renderPullTimer.Interval = TimeSpan.FromMilliseconds(intervalMs);
             _renderPullTimer.Tick += OnRenderPullTick;
             _renderPullTimer.Start();
         }
@@ -435,10 +440,8 @@ public partial class MainViewModel : ObservableObject
         // half the rate, and now also includes diagnostics like
         // GpsToPgnLatencyMs that AutoSteer was writing at 100 Hz.
         // See Plans/perf_data/2026-05-20/ANALYSIS.md.
-        _statusTickTimer = new Avalonia.Threading.DispatcherTimer
-        {
-            Interval = TimeSpan.FromMilliseconds(200),
-        };
+        _statusTickTimer = _timerFactory.Create();
+        _statusTickTimer.Interval = TimeSpan.FromMilliseconds(200);
         _statusTickTimer.Tick += OnStatusTick;
         _statusTickTimer.Start();
         _udpService.ModuleConnectionChanged += OnModuleConnectionChanged;
@@ -465,6 +468,13 @@ public partial class MainViewModel : ObservableObject
             {
                 _autoSteerService.SetDriftCompensation(State.Field.DriftEasting, State.Field.DriftNorthing);
             }
+            else if (e.PropertyName == nameof(State.Field.FieldName))
+            {
+                // CurrentFieldName is a pass-through over State.Field.ActiveField.Name;
+                // re-raise it (and the field/job label) when the active field changes.
+                OnPropertyChanged(nameof(CurrentFieldName));
+                OnPropertyChanged(nameof(CurrentFieldAndJobLabel));
+            }
         };
 
         // Wire YouTurn state -> IsUTurnDistanceVisible computed property
@@ -472,12 +482,12 @@ public partial class MainViewModel : ObservableObject
         WireYouTurnDistanceVisibility();
 
         // Subscribe to ConfigurationStore changes to update NumSections
-        _numSections = Models.Configuration.ConfigurationStore.Instance.NumSections;
-        Models.Configuration.ConfigurationStore.Instance.PropertyChanged += (s, e) =>
+        _numSections = _configStore.NumSections;
+        _configStore.PropertyChanged += (s, e) =>
         {
             if (e.PropertyName == nameof(Models.Configuration.ConfigurationStore.NumSections))
             {
-                NumSections = Models.Configuration.ConfigurationStore.Instance.NumSections;
+                NumSections = _configStore.NumSections;
             }
             else if (e.PropertyName == nameof(Models.Configuration.ConfigurationStore.IsMetric))
             {
@@ -501,10 +511,8 @@ public partial class MainViewModel : ObservableObject
         // Note: Simulator coordinates are restored in RestoreSettings() from saved app settings
         // Default values only used if no settings exist (first run)
 
-        _simulatorTimer = new Avalonia.Threading.DispatcherTimer
-        {
-            Interval = TimeSpan.FromMilliseconds(33) // ~30Hz — pipeline back-pressure skips if processing is slow
-        };
+        _simulatorTimer = _timerFactory.Create();
+        _simulatorTimer.Interval = TimeSpan.FromMilliseconds(33); // ~30Hz — pipeline back-pressure skips if processing is slow
         _simulatorTimer.Tick += OnSimulatorTick;
 
         // Initialize commands (split into partial class files for organization)
@@ -550,14 +558,14 @@ public partial class MainViewModel : ObservableObject
         // scenarios across force-stop restarts without manual taps.
         if (DiagFlags.AutoResumeField)
         {
-            Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            _dispatcher.Post(() =>
             {
                 if (ResumeFieldCommand?.CanExecute(null) == true)
                 {
                     _logger.LogInformation("[DiagFlags] auto_resume_field: invoking ResumeFieldCommand");
                     ResumeFieldCommand.Execute(null);
                 }
-            }, Avalonia.Threading.DispatcherPriority.Background);
+            }, UiDispatcherPriority.Background);
         }
     }
 
@@ -760,7 +768,7 @@ public partial class MainViewModel : ObservableObject
         IsSimulatorPanelVisible = settings.SimulatorEnabled && !DiagFlags.HideAllPanels;
 
         // Initialize tool width from config so implement renders before GPS data flows
-        var config = Models.Configuration.ConfigurationStore.Instance;
+        var config = _configStore;
         double initialToolWidth = 0;
         for (int i = 0; i < config.NumSections && i < 16; i++)
             initialToolWidth += config.Tool.GetSectionWidth(i) / 100.0;
@@ -770,9 +778,9 @@ public partial class MainViewModel : ObservableObject
         // Surface any crash-recovery that happened while loading settings or
         // the active profile pair. Deferred to the dispatcher so the dialog
         // host is ready (RestoreSettings runs during construction).
-        Avalonia.Threading.Dispatcher.UIThread.Post(
+        _dispatcher.Post(
             CheckStartupRecovery,
-            Avalonia.Threading.DispatcherPriority.Background);
+            UiDispatcherPriority.Background);
     }
 
     private void LoadDefaultVehicleProfile()
@@ -965,22 +973,10 @@ public partial class MainViewModel : ObservableObject
         set => SetProperty(ref _crossTrackError, value);
     }
 
-    public string CurrentGuidanceLine
-    {
-        get => _currentGuidanceLine;
-        set => SetProperty(ref _currentGuidanceLine, value);
-    }
-
     public bool IsAutoSteerActive
     {
         get => _isAutoSteerActive;
         set => SetProperty(ref _isAutoSteerActive, value);
-    }
-
-    public int ActiveSections
-    {
-        get => _activeSections;
-        set => SetProperty(ref _activeSections, value);
     }
 
     // AutoSteer Hello and Data properties
@@ -1170,7 +1166,7 @@ public partial class MainViewModel : ObservableObject
     private void OnCoverageBoundsExpanded(object? sender, BoundsExpandedEventArgs e)
     {
         // Reinitialize display bitmap with new expanded bounds
-        Dispatcher.UIThread.Post(() =>
+        _dispatcher.Post(() =>
         {
             _mapService.InitializeCoverageBitmapWithBounds(e.MinE, e.MaxE, e.MinN, e.MaxN);
             _logger.LogDebug($"[Coverage] Display bitmap reinitialized for expanded bounds: E[{e.MinE:F0},{e.MaxE:F0}] N[{e.MinN:F0},{e.MaxN:F0}]");
@@ -1179,7 +1175,7 @@ public partial class MainViewModel : ObservableObject
 
     private void OnAutoSteerToggleRequested(object? sender, AutoSteerToggleEventArgs e)
     {
-        Dispatcher.UIThread.Post(() =>
+        _dispatcher.Post(() =>
         {
             // Toggle autosteer when requested by module communication service
             // (e.g., from work switch or steer switch)
@@ -1189,7 +1185,7 @@ public partial class MainViewModel : ObservableObject
 
     private void OnSectionMasterToggleRequested(object? sender, SectionMasterToggleEventArgs e)
     {
-        Dispatcher.UIThread.Post(() =>
+        _dispatcher.Post(() =>
         {
             // Toggle section master when requested by module communication service
             // This replaces the direct PerformClick() calls from the WinForms implementation
@@ -1219,10 +1215,18 @@ public partial class MainViewModel : ObservableObject
 
 
     // Field management properties
+    // Active field — single home is State.Field.ActiveField (§12.1). Pass-through.
     public Field? ActiveField
     {
-        get => _activeField;
-        set => SetProperty(ref _activeField, value);
+        get => State.Field.ActiveField;
+        set
+        {
+            if (!ReferenceEquals(State.Field.ActiveField, value))
+            {
+                State.Field.ActiveField = value;
+                OnPropertyChanged();
+            }
+        }
     }
 
     public string FieldsRootDirectory
@@ -1497,11 +1501,11 @@ public partial class MainViewModel : ObservableObject
         try
         {
             // Force UI to render busy overlay
-            await Dispatcher.UIThread.InvokeAsync(() => { }, DispatcherPriority.Render);
+            await _dispatcher.InvokeAsync(() => { }, UiDispatcherPriority.Render);
             await Task.Delay(50);
 
-            // Update field state
-            CurrentFieldName = fieldName;
+            // Update field state. CurrentFieldName is a pass-through over
+            // State.Field.ActiveField.Name, set via SetActiveField below.
             IsFieldOpen = true;
             FieldsRootDirectory = Path.GetDirectoryName(fieldPath) ?? string.Empty;
             _gpsPipelineService.SetHasActiveField(true);
@@ -1547,13 +1551,13 @@ public partial class MainViewModel : ObservableObject
                 if (fieldInfo.Origin != null)
                 {
                     SetFieldOrigin(fieldInfo.Origin.Latitude, fieldInfo.Origin.Longitude);
-                    _logger.LogDebug($"[Field] Set origin: {_fieldOriginLatitude}, {_fieldOriginLongitude}");
+                    _logger.LogDebug($"[Field] Set origin: {State.Field.OriginLatitude}, {State.Field.OriginLongitude}");
                     // Only reposition the simulator if the field has a real (non-zero)
                     // georeference. Fields that were never georeferenced persist an
                     // origin of (0, 0), which otherwise clobbers the user's
                     // simulator coords (saved to appsettings on window close).
-                    if (_fieldOriginLatitude != 0 || _fieldOriginLongitude != 0)
-                        SetSimulatorCoordinates(_fieldOriginLatitude, _fieldOriginLongitude);
+                    if (State.Field.OriginLatitude != 0 || State.Field.OriginLongitude != 0)
+                        SetSimulatorCoordinates(State.Field.OriginLatitude, State.Field.OriginLongitude);
                 }
             }
             catch (Exception ex)
@@ -1592,8 +1596,8 @@ public partial class MainViewModel : ObservableObject
                 Boundary = boundary,
                 Origin = new Position
                 {
-                    Latitude = _fieldOriginLatitude,
-                    Longitude = _fieldOriginLongitude,
+                    Latitude = State.Field.OriginLatitude,
+                    Longitude = State.Field.OriginLongitude,
                 }
             };
 
@@ -1654,7 +1658,7 @@ public partial class MainViewModel : ObservableObject
 
             // Load coverage (shows busy overlay — pixel buffer callback needs UI thread for bitmap access)
             State.UI.BusyMessage = "Loading coverage...";
-            await Dispatcher.UIThread.InvokeAsync(() => { }, DispatcherPriority.Render);
+            await _dispatcher.InvokeAsync(() => { }, UiDispatcherPriority.Render);
 
             if (activeJob != null)
             {
@@ -1715,7 +1719,7 @@ public partial class MainViewModel : ObservableObject
             _ = HandleNtripProfileForFieldAsync(fieldName);
 
             // Sync elevation log enabled state from config
-            _elevationLogService.IsEnabled = Models.Configuration.ConfigurationStore.Instance.Display.ElevationLogEnabled;
+            _elevationLogService.IsEnabled = _configStore.Display.ElevationLogEnabled;
 
             // Save as last opened field (persistent state → appstate.json)
             PersistentState.LastOpenedField = fieldName;
@@ -1729,7 +1733,7 @@ public partial class MainViewModel : ObservableObject
             }
 
             // Let GPS events propagate through the UI
-            await Dispatcher.UIThread.InvokeAsync(() => { }, DispatcherPriority.Render);
+            await _dispatcher.InvokeAsync(() => { }, UiDispatcherPriority.Render);
             await Task.Delay(100);
 
             // Notify subscribers that the field is fully loaded
@@ -1778,7 +1782,7 @@ public partial class MainViewModel : ObservableObject
         try
         {
             // Force UI to render busy overlay
-            await Dispatcher.UIThread.InvokeAsync(() => { }, DispatcherPriority.Render);
+            await _dispatcher.InvokeAsync(() => { }, UiDispatcherPriority.Render);
             await Task.Delay(50);
 
             // Save coverage on background thread (RLE compression can take seconds).
@@ -1864,7 +1868,8 @@ public partial class MainViewModel : ObservableObject
             SyncGuidanceStateToPipeline();
         }
 
-        CurrentFieldName = string.Empty;
+        // CurrentFieldName clears via the pass-through when SetActiveField(null)
+        // runs below (State.Field.ActiveField → null).
         IsFieldOpen = false;
         _gpsPipelineService.SetHasActiveField(false);
 
@@ -1907,7 +1912,7 @@ public partial class MainViewModel : ObservableObject
             State.Field.HeadlandLine = null;
             State.Field.HeadlandDistance = 0;
 
-            _currentHeadlandLine = null;
+            State.Field.HeadlandLine = null;
             _mapService.SetHeadlandLine(null);
             _mapService.SetHeadlandVisible(false);
             HeadlandSegments.Clear();
@@ -1931,22 +1936,22 @@ public partial class MainViewModel : ObservableObject
                 State.Field.HeadlandDistance = headlandLine.Tracks[0].MoveDistance;
 
                 // Use direct field assignment to avoid triggering save
-                _currentHeadlandLine = headlandLine.Tracks[0].TrackPoints;
-                _mapService.SetHeadlandLine(_currentHeadlandLine);
+                State.Field.HeadlandLine = headlandLine.Tracks[0].TrackPoints;
+                _mapService.SetHeadlandLine(State.Field.HeadlandLine);
                 OnPropertyChanged(nameof(CurrentHeadlandLine));
 
                 HasHeadland = true;
                 IsHeadlandOn = true;
                 HeadlandDistance = headlandLine.Tracks[0].MoveDistance;
 
-                _logger.LogDebug($"[Headland] Loaded headland from {field.DirectoryPath} ({_currentHeadlandLine.Count} points)");
+                _logger.LogDebug($"[Headland] Loaded headland from {field.DirectoryPath} ({State.Field.HeadlandLine.Count} points)");
             }
             else
             {
                 State.Field.HeadlandLine = null;
                 State.Field.HeadlandDistance = 0;
 
-                _currentHeadlandLine = null;
+                State.Field.HeadlandLine = null;
                 _mapService.SetHeadlandLine(null);
                 HasHeadland = false;
                 IsHeadlandOn = false;
@@ -1959,7 +1964,7 @@ public partial class MainViewModel : ObservableObject
             State.Field.HeadlandLine = null;
             State.Field.HeadlandDistance = 0;
 
-            _currentHeadlandLine = null;
+            State.Field.HeadlandLine = null;
             _mapService.SetHeadlandLine(null);
             HasHeadland = false;
             IsHeadlandOn = false;
@@ -2236,20 +2241,20 @@ public partial class MainViewModel : ObservableObject
     /// </summary>
     private void UpdateTramLines(Track? track)
     {
-        var config = ConfigurationStore.Instance.Tram;
+        var config = _configStore.Tram;
 
         // Set boundary fence for clipping tram lines
-        if (_currentBoundary?.OuterBoundary?.Points != null && _currentBoundary.OuterBoundary.Points.Count >= 3)
+        if (State.Field.CurrentBoundary?.OuterBoundary?.Points != null && State.Field.CurrentBoundary.OuterBoundary.Points.Count >= 3)
         {
-            var fencePts = _currentBoundary.OuterBoundary.Points
+            var fencePts = State.Field.CurrentBoundary.OuterBoundary.Points
                 .Select(p => new Models.Base.Vec3(p.Easting, p.Northing, p.Heading)).ToList();
             _tramLineService.SetBoundaryFence(fencePts);
         }
 
         double fieldWidth = 500;
-        if (_currentBoundary?.OuterBoundary?.Points != null && _currentBoundary.OuterBoundary.Points.Count > 0)
+        if (State.Field.CurrentBoundary?.OuterBoundary?.Points != null && State.Field.CurrentBoundary.OuterBoundary.Points.Count > 0)
         {
-            var pts = _currentBoundary.OuterBoundary.Points;
+            var pts = State.Field.CurrentBoundary.OuterBoundary.Points;
             double maxE = pts.Max(p => p.Easting), minE = pts.Min(p => p.Easting);
             double maxN = pts.Max(p => p.Northing), minN = pts.Min(p => p.Northing);
             fieldWidth = Math.Max(maxE - minE, maxN - minN) * 1.2;
@@ -2276,10 +2281,10 @@ public partial class MainViewModel : ObservableObject
                     hasBoundarySystem = true;
                     int passes = sys.PassCount > 0 ? sys.PassCount : 1;
                     int bndStartIdx = _tramLineService.ParallelTramLines.Count;
-                    if (_currentBoundary?.OuterBoundary?.Points != null &&
-                        _currentBoundary.OuterBoundary.Points.Count >= 3)
+                    if (State.Field.CurrentBoundary?.OuterBoundary?.Points != null &&
+                        State.Field.CurrentBoundary.OuterBoundary.Points.Count >= 3)
                     {
-                        var bndPts = _currentBoundary.OuterBoundary.Points
+                        var bndPts = State.Field.CurrentBoundary.OuterBoundary.Points
                             .Select(p => new Models.Base.Vec3(p.Easting, p.Northing, p.Heading)).ToList();
                         _tramLineService.GenerateBoundaryTramTracks(bndPts, passes, sys.Mode, sys.TramWidth);
                     }
@@ -3253,13 +3258,14 @@ public partial class MainViewModel : ObservableObject
         set => SetProperty(ref _headlandPasses, Math.Max(1, Math.Min(5, value)));
     }
 
-    private List<Models.Base.Vec3>? _currentHeadlandLine;
+    // Headland — single home is State.Field.HeadlandLine (§12.1). Pass-through.
     public List<Models.Base.Vec3>? CurrentHeadlandLine
     {
-        get => _currentHeadlandLine;
+        get => State.Field.HeadlandLine;
         set
         {
-            SetProperty(ref _currentHeadlandLine, value);
+            State.Field.HeadlandLine = value;
+            OnPropertyChanged();
             _mapService.SetHeadlandLine(value);
             SaveHeadlandToFile(value);
 
@@ -3323,11 +3329,19 @@ public partial class MainViewModel : ObservableObject
     /// <summary>
     /// Gets the current field's boundary for use in the headland editor.
     /// </summary>
-    private Boundary? _currentBoundary;
+    // Boundary — single home is State.Field.CurrentBoundary (§12.1). This VM
+    // property is a thin pass-through for binding; no local copy.
     public Boundary? CurrentBoundary
     {
-        get => _currentBoundary;
-        private set => SetProperty(ref _currentBoundary, value);
+        get => State.Field.CurrentBoundary;
+        private set
+        {
+            if (!ReferenceEquals(State.Field.CurrentBoundary, value))
+            {
+                State.Field.CurrentBoundary = value;
+                OnPropertyChanged();
+            }
+        }
     }
 
     // Headland undo state
@@ -3581,16 +3595,12 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
-    private string _currentFieldName = string.Empty;
-    public string CurrentFieldName
-    {
-        get => _currentFieldName;
-        set
-        {
-            if (SetProperty(ref _currentFieldName, value))
-                OnPropertyChanged(nameof(CurrentFieldAndJobLabel));
-        }
-    }
+    /// <summary>
+    /// Open field's name (empty when no field is open). Pass-through over the SoT
+    /// (<see cref="FieldState.ActiveField"/>); no VM-local copy. Change notifications
+    /// come from the State.Field subscription in the constructor (config/state audit §12.1).
+    /// </summary>
+    public string CurrentFieldName => State.Field.ActiveField?.Name ?? string.Empty;
 
     /// <summary>
     /// Active job's task name, or empty when no job is active.
@@ -3709,6 +3719,7 @@ public partial class MainViewModel : ObservableObject
     public ICommand? DriveAroundInnerBoundaryCommand { get; private set; }
     public ICommand? DrawMapInnerBoundaryCommand { get; private set; }
     public ICommand? ToggleDriveThroughCommand { get; private set; }
+    public ICommand? ToggleHardCommand { get; private set; }
     public ICommand? ToggleRecordingCommand { get; private set; }
     public ICommand? ToggleBoundaryLeftRightCommand { get; private set; }
     public ICommand? ToggleBoundaryAntennaToolCommand { get; private set; }
@@ -3810,16 +3821,16 @@ public partial class MainViewModel : ObservableObject
     public ICommand? IncreaseHeadlandDistanceCommand { get; private set; }
     public ICommand? DecreaseHeadlandDistanceCommand { get; private set; }
 
-    public System.Collections.Generic.IReadOnlyList<Models.Base.Vec3>? CurrentHeadlandLineForPreview => _currentHeadlandLine;
+    public System.Collections.Generic.IReadOnlyList<Models.Base.Vec3>? CurrentHeadlandLineForPreview => State.Field.HeadlandLine;
 
     public string HeadlandStatusText
     {
         get
         {
-            if (!HasHeadland || _currentHeadlandLine == null || _currentHeadlandLine.Count < 3)
+            if (!HasHeadland || State.Field.HeadlandLine == null || State.Field.HeadlandLine.Count < 3)
                 return HeadlandSegments.Count > 0 ? $"{HeadlandSegments.Count} lines (no intersections)" : "No headland lines";
 
-            double area = System.Math.Abs(CalculateSignedArea(_currentHeadlandLine)) / 10000.0; // m2 -> hectares
+            double area = System.Math.Abs(CalculateSignedArea(State.Field.HeadlandLine)) / 10000.0; // m2 -> hectares
             return $"{area:F2} ha ({HeadlandSegments.Count} lines)";
         }
     }
@@ -4005,11 +4016,11 @@ public partial class MainViewModel : ObservableObject
 
             // Use field origin for LocalPlane (same origin used for boundary coordinates)
             // This ensures the background image aligns with the boundary
-            var origin = new Wgs84(_fieldOriginLatitude, _fieldOriginLongitude);
+            var origin = new Wgs84(State.Field.OriginLatitude, State.Field.OriginLongitude);
             var sharedProps = new SharedFieldProperties();
             var localPlane = new LocalPlane(origin, sharedProps);
 
-            _logger.LogDebug($"[LoadBG] Field origin from ViewModel: ({_fieldOriginLatitude:F8}, {_fieldOriginLongitude:F8})");
+            _logger.LogDebug($"[LoadBG] Field origin from ViewModel: ({State.Field.OriginLatitude:F8}, {State.Field.OriginLongitude:F8})");
             _logger.LogDebug($"[LoadBG] LocalPlane origin: ({localPlane.Origin.Latitude:F8}, {localPlane.Origin.Longitude:F8})");
             _logger.LogDebug($"[LoadBG] WGS84 bounds: NW=({nwLat:F8}, {nwLon:F8}), SE=({seLat:F8}, {seLon:F8})");
 
@@ -4022,7 +4033,7 @@ public partial class MainViewModel : ObservableObject
             _logger.LogDebug($"[LoadBG] Local bounds: NW=({nwLocal.Easting:F2}, {nwLocal.Northing:F2}), SE=({seLocal.Easting:F2}, {seLocal.Northing:F2})");
 
             // Verify field origin converts to (0,0) in local coords
-            var originWgs = new Wgs84(_fieldOriginLatitude, _fieldOriginLongitude);
+            var originWgs = new Wgs84(State.Field.OriginLatitude, State.Field.OriginLongitude);
             var originLocal = localPlane.ConvertWgs84ToGeoCoord(originWgs);
             _logger.LogDebug($"[LoadBG] Field origin in local coords (should be ~0,0): ({originLocal.Easting:F2}, {originLocal.Northing:F2})");
 
@@ -4032,7 +4043,7 @@ public partial class MainViewModel : ObservableObject
                 _mapService.SetBackgroundImageWithMercator(backPicPath,
                     nwLocal.Easting, nwLocal.Northing, seLocal.Easting, seLocal.Northing,
                     mercMinX, mercMaxX, mercMinY, mercMaxY,
-                    _fieldOriginLatitude, _fieldOriginLongitude);
+                    State.Field.OriginLatitude, State.Field.OriginLongitude);
             }
             else
             {
@@ -4070,7 +4081,8 @@ public partial class MainViewModel : ObservableObject
                 Index = index++,
                 BoundaryType = "Outer",
                 AreaAcres = boundary.OuterBoundary.AreaAcres,
-                IsDriveThrough = boundary.OuterBoundary.IsDriveThrough
+                IsDriveThrough = boundary.OuterBoundary.IsDriveThrough,
+                IsHard = boundary.OuterBoundary.IsHard
             });
         }
 
@@ -4085,7 +4097,8 @@ public partial class MainViewModel : ObservableObject
                     Index = index++,
                     BoundaryType = $"Inner {i + 1}",
                     AreaAcres = inner.AreaAcres,
-                    IsDriveThrough = inner.IsDriveThrough
+                    IsDriveThrough = inner.IsDriveThrough,
+                    IsHard = inner.IsHard
                 });
             }
         }
@@ -4283,7 +4296,7 @@ public partial class MainViewModel : ObservableObject
                 headlandPoints.Add(new Vec3(point.Easting, point.Northing, point.Heading));
             }
             State.Field.HeadlandLine = headlandPoints;
-            _currentHeadlandLine = headlandPoints;
+            State.Field.HeadlandLine = headlandPoints;
             _mapService.SetHeadlandLine(headlandPoints);
             HasHeadland = true;
             IsHeadlandOn = true;
@@ -4513,20 +4526,20 @@ public partial class MainViewModel : ObservableObject
     {
         BoundaryMapExistingPolygons.Clear();
 
-        if (_currentBoundary == null || (_fieldOriginLatitude == 0 && _fieldOriginLongitude == 0))
+        if (State.Field.CurrentBoundary == null || (State.Field.OriginLatitude == 0 && State.Field.OriginLongitude == 0))
             return;
 
         try
         {
-            var origin = new Wgs84(_fieldOriginLatitude, _fieldOriginLongitude);
+            var origin = new Wgs84(State.Field.OriginLatitude, State.Field.OriginLongitude);
             var sharedProps = new SharedFieldProperties();
             var localPlane = new LocalPlane(origin, sharedProps);
 
             // Add outer boundary
-            if (_currentBoundary.OuterBoundary?.Points != null && _currentBoundary.OuterBoundary.Points.Count >= 3)
+            if (State.Field.CurrentBoundary.OuterBoundary?.Points != null && State.Field.CurrentBoundary.OuterBoundary.Points.Count >= 3)
             {
                 var wgs84Points = new List<(double Latitude, double Longitude)>();
-                foreach (var pt in _currentBoundary.OuterBoundary.Points)
+                foreach (var pt in State.Field.CurrentBoundary.OuterBoundary.Points)
                 {
                     var geoCoord = new GeoCoord(pt.Northing, pt.Easting);
                     var wgs84 = localPlane.ConvertGeoCoordToWgs84(geoCoord);
@@ -4536,7 +4549,7 @@ public partial class MainViewModel : ObservableObject
             }
 
             // Add inner boundaries
-            foreach (var inner in _currentBoundary.InnerBoundaries)
+            foreach (var inner in State.Field.CurrentBoundary.InnerBoundaries)
             {
                 if (inner.Points.Count >= 3)
                 {
@@ -4570,7 +4583,7 @@ public partial class MainViewModel : ObservableObject
             var fieldPath = Path.Combine(_settingsService.Settings.FieldsDirectory, CurrentFieldName);
             var boundary = _boundaryFileService.LoadBoundary(fieldPath) ?? new Boundary();
 
-            var origin = new Wgs84(_fieldOriginLatitude, _fieldOriginLongitude);
+            var origin = new Wgs84(State.Field.OriginLatitude, State.Field.OriginLongitude);
             var sharedProps = new SharedFieldProperties();
             var localPlane = new LocalPlane(origin, sharedProps);
 
@@ -4725,7 +4738,7 @@ public partial class MainViewModel : ObservableObject
         System.Diagnostics.Debug.WriteLine($"[Headland] Result points: {result.OuterHeadlandLine?.Count ?? 0}");
 
         // Save undo state before applying
-        _previousHeadlandLine = _currentHeadlandLine != null ? new List<Vec3>(_currentHeadlandLine) : null;
+        _previousHeadlandLine = State.Field.HeadlandLine != null ? new List<Vec3>(State.Field.HeadlandLine) : null;
         _previousHasHeadland = HasHeadland;
 
         CurrentHeadlandLine = result.OuterHeadlandLine;
@@ -4733,10 +4746,10 @@ public partial class MainViewModel : ObservableObject
         HasHeadland = true;
         IsHeadlandOn = true;
 
-        // Update _currentHeadlandLine for YouTurn zone detection (same as SetCurrentBoundary does on field load)
+        // Update State.Field.HeadlandLine for YouTurn zone detection (same as SetCurrentBoundary does on field load)
         if (result.OuterHeadlandLine != null && result.OuterHeadlandLine.Count >= 3)
         {
-            _currentHeadlandLine = result.OuterHeadlandLine;
+            State.Field.HeadlandLine = result.OuterHeadlandLine;
             State.Field.HeadlandLine = result.OuterHeadlandLine;
             _mapService.SetHeadlandLine(result.OuterHeadlandLine);
             _mapService.SetHeadlandVisible(true);
@@ -5866,8 +5879,10 @@ public class BoundaryListItem
     public string BoundaryType { get; set; } = string.Empty;
     public double AreaAcres { get; set; }
     public bool IsDriveThrough { get; set; }
+    public bool IsHard { get; set; }
     public string AreaDisplay => $"{AreaAcres:F2} Ac";
     public string DriveThruDisplay => IsDriveThrough ? "Yes" : "--";
+    public string HardDisplay => IsHard ? "Hard" : "Soft";
 }
 
 /// <summary>

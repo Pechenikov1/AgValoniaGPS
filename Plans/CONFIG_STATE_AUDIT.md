@@ -250,3 +250,300 @@ Implemented as named below (the snapshot/service ended up as `PersistentAppState
 `Alpha`, `IsDisplayTramControl`, `IsEnabled`) lacked a home; those now persist per-field.
 `Passes`/`DisplayMode` were intentionally left on the Guidance sync to avoid double-sourcing —
 a smaller follow-up could consolidate them if desired.
+
+---
+
+## 11. Follow-up scope — de-ambient the VM (added 2026-06-14, not scheduled)
+
+**Different axis from §1–§10.** Everything above is about *data single-source-of-truth* — which
+of the three stores owns a value. This item is about *ambient framework coupling*: the ViewModel
+reaching into framework/global statics **out of the air** instead of receiving them through its
+constructor. It's the same "not injected, just grabbed" smell, one layer down, and it's exactly
+what `Plans/ARCHITECTURE.md` flags under "Tight Coupling Points → Historical, needs refactor" —
+which the completed storage audit deliberately did **not** touch.
+
+### 11.1 Injectable `IDispatcher` (the concrete item)
+The VM depends directly on `Avalonia.Threading.Dispatcher.UIThread` — a static from the
+*presentation* framework — in **~10 `MainViewModel` partials**: ~18 `Post`, 5 `InvokeAsync`,
+7 `CheckAccess`. By the project's own MVVM rule (VM coordinates, doesn't bind itself to the View
+framework), this should be an injected `IDispatcher`:
+- Define `IDispatcher` (Post / InvokeAsync / CheckAccess) in `AgValoniaGPS.Services` (or Models).
+- Avalonia-backed implementation registered in **Desktop + iOS + Android** (three-platform DI rule).
+- VM partials take `IDispatcher` via ctor; replace every `Dispatcher.UIThread.*` call.
+- Behavior-preserving for the current apps; independently shippable; no data-tier change.
+
+**Payoff:** (a) VM unit tests stop needing `Avalonia.Headless` *just to supply a dispatcher* — an
+inline/synchronous `IDispatcher` suffices; (b) it unblocks the headless web-UI host, which has a
+VM consumer with no UI thread (see `Plans/REMOTE_WEB_UI_SPLIT.md` §9.1 + the
+`Spikes/HeadlessHostSpike` proof — the spike had to pull in `Avalonia.Headless` purely for this).
+
+**Why it wasn't already done (and wasn't wrong to defer):** until the headless host, every VM
+consumer was an Avalonia View on a real UI thread, so `Dispatcher.UIThread` was correct everywhere
+and an abstraction would have had exactly one implementation. Defensible YAGNI; the web UI is the
+forcing function that makes it earn its keep.
+
+### 11.2 Sibling: static store access ✅ DONE
+The same "ambient, not injected" smell applied to `ConfigurationStore.Instance` and
+`ApplicationState.Instance`, read statically across services and VMs (also flagged in
+`ARCHITECTURE.md`). The storage audit (§1–§10) made these the enforced SoT but left them as
+**statics**. Resolved on `audit/de-static-configstore` (v26.5.48):
+
+- **`ConfigurationStore`** is now registered in DI on all 3 platforms
+  (`services.AddSingleton(_ => ConfigurationStore.Instance)` — DI-resolved instance ≡ `.Instance`,
+  one object) and **injected via constructor** into all 26 Services/ViewModels that previously grabbed
+  the static (`MainViewModel` + 8 partials via a `_configStore` field behind the existing
+  `ConfigStore`/`Vehicle`/`Tool`/`Guidance` accessors; 18 service classes). A few static helpers that
+  could not hold a field got a trailing `ConfigurationStore` parameter
+  (`NmeaParserServiceFast.ParseIntoState`, `GpsFixQualityValidator.IsAcceptable`,
+  `DebugDumpService.CreateDump`); `AudioServiceBase` threads it through the 3 platform subclass ctors.
+- **Reset-settings hot-swap removed.** "Reset All Settings" used to call
+  `ConfigurationStore.SetInstance(new ConfigurationStore())` — *replacing the object*, which would
+  strand every injected reference. It now resets **in place**: `ResetToDefaults()` → `Save()` →
+  `LoadAppSettings()` reapplies the default DTO into the *same* store instance (identity + PropertyChanged
+  subscriptions preserved). This is the correct model regardless of injection.
+- **`ApplicationState`** was already injected in production (the VM takes it via ctor); its `.Instance`
+  survived only in tests, so no production change was needed.
+- The static `Instance`/`SetInstance` accessors remain **only** as the seam for framework-instantiated
+  Avalonia Views (the XAML loader news them up outside DI — 7 View files keep reading the shared
+  singleton) and for test setup. A new guard test `NoAmbientStoreAccessTests` source-scans
+  `Shared/AgValoniaGPS.{Services,ViewModels}` and fails CI if `ConfigurationStore.Instance` /
+  `ApplicationState.Instance` regrows in business logic. 1502 tests green.
+
+### 11.3 Injectable `ITimer` / scheduler (the remaining headless blocker)
+The same axis again — an ambient Avalonia type instantiated *inside* the VM, this time
+`Avalonia.Threading.DispatcherTimer`. The `MainViewModel` ctor creates ~5 of them (status-strip
+rotation, clock, autosave, auto-day/night, simulator). `DispatcherTimer` captures
+`Dispatcher.UIThread` at construction, so it **throws in a process with no Avalonia dispatcher** —
+which is the concrete reason a headless host still needs `Avalonia.Headless` even after §11.1.
+After the marshalling calls were abstracted, this is the last thing that *functionally* ties a
+headless boot to Avalonia (the remaining `Avalonia.Point`/`Color`/`Application.Current` uses are
+value-type math or null-guarded and don't block headless execution).
+
+- Define `ITimer` / `IScheduler` (create a periodic callback with an interval; start/stop; change
+  interval) and inject it like `IUiDispatcher`. Richer than the dispatcher because timers have
+  lifecycle (start/stop/interval changes), so the interface is a little larger.
+- Avalonia-backed impl wraps `DispatcherTimer` (Views, alongside `AvaloniaUiDispatcher`); a
+  threaded/`PeriodicTimer`-based impl serves headless hosts and tests.
+- Replace the ~5 ctor `DispatcherTimer` sites; `DispatcherTimer` then exists only in the View layer.
+
+**Why now / why noted:** surfaced by the remote/web-UI **Phase 0 retest** after §11.1 merged — the
+marshalling hurdle cleared, but the spike still had to keep `Avalonia.Headless` purely for these
+timers. It is **not** blocking Phase 1 "alongside the Avalonia app" (the live app supplies a real
+dispatcher + timers); it is the prerequisite for the **fully Avalonia-free cab-PC host**
+(`Plans/REMOTE_WEB_UI_SPLIT.md` Phase 4/5). If the web-UI work proceeds, fix it there; otherwise it
+stands as a standalone follow-up.
+
+**Status:**
+- §11.1 `IUiDispatcher` — **DONE**, merged to `develop` (PR #470, 2026-06-14).
+- §11.2 static store de-static-ing — **DONE** (`audit/de-static-configstore`, v26.5.48). `ConfigurationStore`
+  registered in DI + injected into all 26 Services/VMs; reset-settings hot-swap replaced with in-place
+  reload; static `Instance` kept only as the View + test seam, guarded by `NoAmbientStoreAccessTests`.
+- §11.3 `ITimer`/scheduler — **DONE** (PR #471). `IUiTimer` + `IUiTimerFactory`
+  (Services); impls: `AvaloniaUiTimer` (Views, wraps `DispatcherTimer` — the 3
+  platforms), `ManualUiTimer` (tests, framework-free, non-firing), `ThreadingUiTimer`
+  (headless host, `System.Threading.Timer`-based, fires with no Avalonia). All 7
+  VM `DispatcherTimer` sites (status-strip, clock, auto-day/night, autosave,
+  simulator, render-pull, status-tick) now go through the injected factory.
+
+With §11.1 + §11.3 done, the VM no longer instantiates **any** Avalonia type at
+runtime that a headless boot would trip on (dispatcher + timers both abstracted).
+With §11.2 done, the business logic no longer reaches for the ambient store
+singletons either — **§11 is complete**. The remaining `ConfigurationStore.Instance`
+uses live only in framework-instantiated Views and test setup (the sanctioned seam).
+
+All surfaced by the remote/web-UI Phase 0 spike + retest.
+
+---
+
+## 12. Runtime field-geometry/selection SoT — NOT covered by §1–§10 (added 2026-06-14)
+
+**Different axis again.** §1–§10 audited *config & persisted* values; §11 audited *ambient
+framework coupling*. This section is the gap both missed: **runtime domain state** (the field's
+boundary, headland, origin, tracks, active/selected track, section/recording readouts). The
+audit's own §2 Rule — *"read from the central store at point of use; never keep a local copy"* —
+was enforced for config but **never for runtime state**, so the same datum is copied across up to
+three layers:
+
+- **Layer 1 — the `Field` model (`ActiveField`):** the persisted form (`Boundary`, `Origin`, `Name`).
+- **Layer 2 — `ApplicationState` sub-states (`FieldState`, `GuidanceState`, …):** the service-read form.
+- **Layer 3 — `MainViewModel` private fields:** a UI-bindable copy (`_currentBoundary`, `_currentHeadlandLine`, …).
+
+This is why every remote/web-UI projection of a datum was a guessing game (it cost two debugging
+detours on the web client). Findings below are **grep-verified** (Explore sweep + manual confirm).
+
+### 12.1 Field-geometry/selection cluster — collapse to one canonical home
+
+| Datum | Homes (file) | Canonical (services read) | Action |
+|---|---|---|---|
+| **Boundary** | `Field.Boundary` · `FieldState.CurrentBoundary` · VM `_currentBoundary` | **`FieldState.CurrentBoundary`** (GpsPipelineService:1657, SectionControlService:878/890/927) | keep `Field.Boundary` for save; **drop VM copy** — bind to state |
+| **Headland** | `Boundary.HeadlandPolygon` · `FieldState.HeadlandLine` · VM `_currentHeadlandLine` | **`FieldState.HeadlandLine`** (SectionControlService:922) | keep polygon for save; **drop VM copy**. (`_previousHeadlandLine` = undo, separate, keep) |
+| **Field origin** | `Field.Origin` · `FieldState.OriginLatitude/Longitude` + `LocalPlane` · VM `_fieldOriginLatitude/Longitude` | **`FieldState` Origin + `LocalPlane`** (pipeline/AutoSteer coord conversion) | **drop VM copy** |
+| **Field name** | `Field.Name` · `FieldState.FieldName` (computed) · VM `_currentFieldName` | **`Field.Name`** (FieldState.FieldName computes from it — fine) | **drop VM copy** |
+| **Tracks** | `FieldState.Tracks` · VM `SavedTracks` (hand-synced on field load) | pick one (likely `FieldState.Tracks`) | collapse to one collection |
+| **Active track** | `FieldState.ActiveTrack` · `GuidanceState.ActiveTrack` · `GpsPipelineService._activeTrack` (cycle-local, lock-guarded) · VM `SelectedTrack` | pipeline `_activeTrack` is legit working copy; **`FieldState.ActiveTrack`** is the state SoT | dedupe the `FieldState`/`GuidanceState` mirror; keep pipeline working copy |
+
+### 12.2 Dead state — delete
+
+- **`FieldState.Boundaries`** (ObservableCollection) + **`FieldState.HasBoundary`** — **0 writers, 0 readers** (verified). The lone `AgShareFieldParser` write targets a *result* object, not state.
+- **`FieldState.SelectedTrack`** — **0 references** anywhere (verified). All selection flows through VM `SelectedTrack`.
+
+### 12.3 VM display-shadow fields — bind directly to state, delete the field ✅ DONE
+
+`MainViewModel` mirrored several read-only state values purely for binding. Investigation
+split these into two cases — collapse the genuine mirrors, **delete** the dead ones:
+- `_boundaryPointCount` / `_boundaryAreaHectares` ↔ `BoundaryRecState.PointCount/AreaHectares`
+  — genuine hand-synced mirrors (bound in `BoundaryPlayerPanel` + `StartWorkSessionDialogPanel`).
+  **Collapsed** to pass-through properties on `State.BoundaryRec` (getter reads state; private
+  setter writes state + `OnPropertyChanged`); backing fields removed; the recording handlers no
+  longer write state twice.
+- `_activeSections` (`ActiveSections`) and `_currentGuidanceLine` (`CurrentGuidanceLine`) — turned
+  out to be **dead**: never written, never read/bound anywhere (the only `ActiveSections` hits in
+  the repo are an unrelated `VirtualMachineModule`). `SectionState.ActiveSectionCount` is *computed*
+  from the section array, not a hand-synced mirror. Both VM properties + backing fields **deleted**.
+
+Resolved in `audit/state-sot-fix-12-3` (v26.5.46); 1502 tests green.
+
+### 12.4 Cross-state / simulator duplication ✅ DONE
+
+Investigated each flagged copy; outcome was **delete dead state + confirm one legit mirror** —
+no risky cross-state collapse was warranted.
+
+- **Active track in `GuidanceState` and `FieldState`** — *not* cruft. `FieldState.ActiveTrack`
+  is the selection SoT (set by the `SelectedTrack` command, read by the map/pipeline/DebugDump).
+  `GuidanceState.ActiveTrack` is the **observable mirror of `GuidanceWorkingState`** (the Phase D D7
+  property-for-property snapshot mirror, enforced by `GuidanceWorkingStateTests`) — semantically "the
+  track the *cycle* is guiding on," which lags selection by one cycle *by design*. Distinct semantics,
+  correct-by-design, part of a live + tested contract → **kept**, reclassified clean (§12.5).
+- **Vehicle ↔ Simulator position** — there was **no real runtime copy**. `SimulatorState`
+  (`ApplicationState.Simulator`) turned out to be **entirely dead**: every field write-only or
+  unreferenced (`Latitude/Longitude/Easting/Northing/Heading/FixQuality/SatelliteCount` had zero refs;
+  `IsEnabled/IsRunning/Speed/TargetSpeed/SteerAngle` were write-only). It was superseded during §1–§10
+  by `PersistentState.Simulator*` (appstate.json) + `_simulatorService` (live pose) — the sim feeds
+  `VehicleState` through the GPS pipeline like a real receiver (a legit producer→consumer flow, not a
+  shadow). **Deleted `SimulatorState`** + its `ApplicationState` property + `Reset()` call + all dead
+  write sites in `MainViewModel.Simulator.cs`.
+- **`GuidanceState.SteerAngle` → `SimulatorState.SteerAngle`** feedback "sync" — wrote into the dead
+  `SimulatorState`; **removed** with the deletion above. (The real steer feedback to the sim goes
+  through `_simulatorService.Tick(SimulatorSteerAngle)`.)
+- **`_simulatorLocalPlane`** (VM-local, flagged for review) — reviewed: a legit input-stage bootstrap
+  helper. It converts the sim's synthetic WGS84 → local coords *before* the cycle has created
+  `State.Field.LocalPlane`, already uses the field origin when one exists (value-consistent), and is
+  reset on field/coord changes. Not a competing home → stays VM-local.
+
+Resolved in `audit/state-sot-fix-12-4` (v26.5.47); 1502 tests green.
+
+### 12.5 Confirmed CLEAN — out of scope (so the target list is bounded)
+
+Verified single-owner / not duplicated — **do not touch**:
+- Working-state classes: `GuidanceWorkingState`, `YouTurnWorkingState` (cycle-worker-owned),
+  `TrackGuidanceState` (per-loop PID/filter), `ModuleSwitchState` (IPC DTO), `SensorState` (live IMU singleton).
+- `ConnectionState`, `RecordedPathState`, most of `YouTurnState` — clean.
+- **`UIState` dialog-visibility properties are LIVE** — **39 `State.UI.IsXVisible` bindings in AXAML**
+  (an Explore sweep miscalled these "dead" by not grepping `.axaml`; corrected here).
+- Genuine VM-local UI state (tab index, wizard step, dialog selections, `_pending*`, perf counters, `_currentFps/_currentTime`).
+- **`GuidanceState.ActiveTrack`** — the Phase D D7 observable mirror of `GuidanceWorkingState.ActiveTrack`
+  (the track the cycle is guiding on); distinct from `FieldState.ActiveTrack` (selection SoT). Kept (§12.4).
+- **`_simulatorLocalPlane`** (VM-local) — input-stage bootstrap plane for the sim's WGS84→local
+  conversion; reviewed clean under §12.4 (uses field origin when present, reset on field/coord change).
+
+### 12.6 Fix order
+
+1. ✅ **Field-geometry cluster (12.1)** + delete dead (12.2): collapse boundary/headland/origin/name to
+   their canonical home, remove the VM shadows, delete `FieldState.Boundaries`/`HasBoundary`/`SelectedTrack`.
+2. ✅ **VM display shadows (12.3):** rebind to state, delete fields.
+3. ✅ **Cross-state/sim dedupe (12.4):** delete dead `SimulatorState`; confirm `GuidanceState.ActiveTrack` legit.
+Each ships with the `NoBypassWritesTests`-style guard extended to flag *runtime-state* local copies,
+so this class can't silently regrow.
+
+**Status:** ✅ **COMPLETE.** §12.1/§12.2 (field-geometry + dead deletion), §12.3 (primitive display
+mirrors), and §12.4 (cross-state/sim) all resolved. Domain-typed VM shadows **and** primitive display
+mirrors are now zero; the only remaining intentional cross-state reference (`GuidanceState.ActiveTrack`)
+is a documented, tested observable-mirror. `StateShadowGuardTests` guards domain-typed regrowth in CI.
+
+### 12.7 `SectionState` per-section on/off was dead (never written) — ✅ RESOLVED
+
+`ApplicationState.Sections` (`SectionState`) held per-section on/off flags
+(`_sectionActive[]`, `Section1..8Active`, `GetSectionActive`/`SetSectionActive`/`SetAllSections`/
+`GetAllSectionsAsBits`) plus `ActiveSectionCount`, `NumberOfSections`, `IsMasterOn`,
+`IsManualMode`/`IsAutoMode`, `IsSectionControlInHeadland` — **every member verified dead**
+(0 production writers, 0 production readers). The authoritative per-section on/off is
+`ISectionControlService.SectionStates[i].IsOn` (the source coverage paints from); every consumer
+already reads that.
+
+**Resolved (2026-06-16, `audit/config-apply-gap` v26.5.49):** decision = **delete** (mirrors the
+§12.4 `SimulatorState` deletion). Removed the whole `SectionState` class (file deleted) +
+`ApplicationState.Sections` property + its `Reset()` call. 1504 tests green.
+
+---
+
+## 13. Config flags persist but aren't applied to the live renderer/behavior — ✅ MOSTLY RESOLVED
+
+A **distinct axis** from §1–§12: the **apply gap**. Several `ConfigStore.Display.*` flags persist
+correctly but nothing connected them to the running map/behavior, so toggling them (from the
+Settings / Screen-&-Alerts panel — and the web client, which writes the same flag the menu binds to)
+did nothing on the **native** app. Surfaced by the web-UI Screen & Alerts work; the web is faithful —
+this was native config→renderer wiring.
+
+### 13.1 Display toggles disconnected from the renderer
+
+- **Grid** — three reps (`Display.GridVisible` / `_displaySettings.IsGridOn` /
+  `SkiaMapControl.IsGridVisible` StyledProperty); the renderer read only the StyledProperty, pushed
+  only from the *on-screen-button* path, so the *Settings* toggle was dead. **Fixed:** collapsed to one
+  source — the map control reads `ConfigStore.Display.GridVisible` directly and repaints on
+  `Display.PropertyChanged`. Deleted the `IsGridVisible` StyledProperty + `SetGridVisible` from the
+  control, both interfaces (`ISharedMapControl`, `IMapService`, iOS `IMapControl`), all 3 platform
+  `MapService` impls, and the Desktop/iOS/Android push/binding sites. Both toggles now drive the SoT.
+- **Svenn Arrow** (`Display.SvennArrowVisible`), **Headland-Distance HUD**
+  (`Display.HeadlandDistanceVisible`), **Extra Guidelines** (`Display.ExtraGuidelines` + count) — these
+  had config flags + UI toggles + unused `MapRenderState` fields but **no draw code anywhere**.
+  **Implemented** (ported from AgOpenGPS): Extra Guidelines (parallel reference lines either side of the
+  active track, green over black shadow, zoom-gated); Svenn lookahead arrow (yellow triangle ahead of
+  the wheelbase, sized off the visible world span); Headland HUD (screen-space rounded box, yellow /
+  red-on-warning, **displaying the pipeline's already-computed `HeadlandProximityDistance`** —
+  `State.Field.HeadlandProximityDistance`, not a renderer recompute).
+- **The backbone:** a single `ConfigStore.Display.PropertyChanged` subscription in `SkiaMapControl`
+  now triggers a repaint, so every `displayCfg`-sourced flag (grid, Svenn, headland HUD, extra
+  guidelines, field texture, line smoothing) applies **live**, from either the on-screen buttons or
+  the Settings panel.
+- **Display Quality** (`Display.DisplayResolutionMultiplier`) — ⏳ **still open.** It *is* applied, but
+  only at coverage-bitmap **init** (field open); changing it mid-session has no live effect because
+  that needs a coverage-bitmap rebuild + reprojection (a coverage-system change, not a draw wire).
+  Tracked as its own follow-up to avoid a rushed coverage rebuild.
+
+### 13.2 Cross-wiring side effect — ✅ RESOLVED
+
+Toggling `Display.UTurnButtonVisible` (a *display-visibility* preference) also hid the right-nav
+auto-U-turn **arming** toggle (`ToggleYouTurnCommand`, the only control that enables auto-uturn),
+making the behavior unreachable. **Fixed:** `IsUTurnButtonVisible` no longer reads
+`Display.UTurnButtonVisible` — the arming/direction controls are gated only by autosteer + track
+state (+ `HasBoundary`), so they're always reachable; the flag now governs **only** the on-map U-turn
+overlay (`IsUTurnOverlayVisible`).
+
+### 13.3 Guard
+
+Added `DisplayRenderFlagsAppliedTests` (source-scan, NoBypassWrites-style): asserts every
+render-affecting `Display.*` flag is actually read by `SkiaMapControl`. The reflection shadow-guard
+can't catch an *apply* gap; this does, at the wiring layer.
+
+---
+
+## 14. Final two items — ✅ RESOLVED (2026-06-16, v26.5.50)
+
+Both items previously deferred from the apply-gap branch are now done:
+
+1. **§13.1 Display Quality live re-apply** — ✅ DONE. The detection-bits coverage source is
+   resolution-independent (only the display bitmap's cell size scales with the multiplier), so a live
+   rebuild is lossless. Added `ISharedMapControl.RebuildCoverageBitmapForResolutionChange()` (+
+   `IMapService` + 3 platform forwards): it recomputes the cell size at the current bounds, recreates
+   the display bitmap, and repaints from the detection cells — **preserving camera state** (unlike
+   `InitializeCoverageBitmapWithBounds`, which is a field-open and recenters). `CycleDisplayResolutionCommand`
+   calls it when a field is open, so Quality changes take effect immediately instead of only on next
+   field open.
+2. **§12.1 `_currentFieldName`** — ✅ DONE. Collapsed to a read-only pass-through
+   `CurrentFieldName => State.Field.ActiveField?.Name ?? string.Empty`; all 6 writes removed; the
+   field/job label re-raises from the existing `State.Field.PropertyChanged` (`FieldName`) subscription.
+   Fixed 3 **latent SoT bugs** uncovered in the process — the copy / KML-import / ISO-XML-import flows
+   set `IsFieldOpen = true` but never set `ActiveField`; they now call `SetActiveField` (the KML flow
+   does it before `SetCurrentBoundary` so the boundary attaches to the active field). 1504 tests green.
+
+**§1–§14 of this audit are now complete.**

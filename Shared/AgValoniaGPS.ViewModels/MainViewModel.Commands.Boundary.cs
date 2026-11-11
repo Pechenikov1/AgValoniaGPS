@@ -37,10 +37,10 @@ public partial class MainViewModel
         // Boundary Map Dialog Commands (satellite map boundary drawing)
         ShowBoundaryMapDialogCommand = new RelayCommand(() =>
         {
-            if (_fieldOriginLatitude != 0 || _fieldOriginLongitude != 0)
+            if (State.Field.OriginLatitude != 0 || State.Field.OriginLongitude != 0)
             {
-                BoundaryMapCenterLatitude = _fieldOriginLatitude;
-                BoundaryMapCenterLongitude = _fieldOriginLongitude;
+                BoundaryMapCenterLatitude = State.Field.OriginLatitude;
+                BoundaryMapCenterLongitude = State.Field.OriginLongitude;
             }
             else if (Latitude != 0 || Longitude != 0)
             {
@@ -74,8 +74,8 @@ public partial class MainViewModel
                     // Use the EXISTING field origin for LocalPlane conversion - do NOT change it!
                     // The field origin is set when the field is created and should remain constant.
                     // Changing it would break all local coordinate systems.
-                    var originLat = _fieldOriginLatitude;
-                    var originLon = _fieldOriginLongitude;
+                    var originLat = State.Field.OriginLatitude;
+                    var originLon = State.Field.OriginLongitude;
 
                     _logger.LogDebug($"[BoundaryMap] Using existing field origin: ({originLat:F8}, {originLon:F8})");
                     _logger.LogDebug($"[BoundaryMap] Current simulator position: ({Latitude:F8}, {Longitude:F8})");
@@ -348,7 +348,7 @@ public partial class MainViewModel
         ResetHeadlandCommand = new RelayCommand(() =>
         {
             // Save for undo
-            _previousHeadlandLine = _currentHeadlandLine != null ? new List<Vec3>(_currentHeadlandLine) : null;
+            _previousHeadlandLine = State.Field.HeadlandLine != null ? new List<Vec3>(State.Field.HeadlandLine) : null;
             _previousHasHeadland = HasHeadland;
 
             ClearHeadlandCommand?.Execute(null);
@@ -390,14 +390,14 @@ public partial class MainViewModel
 
             if (_previousHeadlandLine != null && _previousHeadlandLine.Count >= 3)
             {
-                _currentHeadlandLine = _previousHeadlandLine;
+                State.Field.HeadlandLine = _previousHeadlandLine;
                 State.Field.HeadlandLine = _previousHeadlandLine;
                 _mapService.SetHeadlandLine(_previousHeadlandLine);
                 _mapService.SetHeadlandVisible(true);
             }
             else
             {
-                _currentHeadlandLine = null;
+                State.Field.HeadlandLine = null;
                 State.Field.HeadlandLine = null;
                 _mapService.SetHeadlandVisible(false);
             }
@@ -413,14 +413,14 @@ public partial class MainViewModel
         TurnOffHeadlandCommand = new RelayCommand(() =>
         {
             // Save for undo
-            _previousHeadlandLine = _currentHeadlandLine != null ? new List<Vec3>(_currentHeadlandLine) : null;
+            _previousHeadlandLine = State.Field.HeadlandLine != null ? new List<Vec3>(State.Field.HeadlandLine) : null;
             _previousHasHeadland = HasHeadland;
 
             IsHeadlandOn = false;
             HasHeadland = false;
             CurrentHeadlandLine = null;
             HeadlandPreviewLine = null;
-            _currentHeadlandLine = null;
+            State.Field.HeadlandLine = null;
             State.Field.HeadlandLine = null;
             _mapService.SetHeadlandVisible(false);
             OnPropertyChanged(nameof(HeadlandStatusText));
@@ -771,6 +771,54 @@ public partial class MainViewModel
                         SetCurrentBoundary(boundary);
                         RefreshBoundaryList();
                         StatusMessage = $"Inner {i + 1} drive-through: {(boundary.InnerBoundaries[i].IsDriveThrough ? "On" : "Off")}";
+                        return;
+                    }
+                    currentIndex++;
+                }
+            }
+        });
+
+        ToggleHardCommand = new RelayCommand(() =>
+        {
+            if (SelectedBoundaryIndex < 0)
+            {
+                StatusMessage = "Select a boundary first";
+                return;
+            }
+
+            if (string.IsNullOrEmpty(CurrentFieldName)) return;
+
+            var fieldPath = Path.Combine(_settingsService.Settings.FieldsDirectory, CurrentFieldName);
+            var boundary = _boundaryFileService.LoadBoundary(fieldPath);
+            if (boundary == null) return;
+
+            int currentIndex = 0;
+
+            if (boundary.OuterBoundary != null && boundary.OuterBoundary.IsValid)
+            {
+                if (currentIndex == SelectedBoundaryIndex)
+                {
+                    boundary.OuterBoundary.IsHard = !boundary.OuterBoundary.IsHard;
+                    _boundaryFileService.SaveBoundary(boundary, fieldPath);
+                    SetCurrentBoundary(boundary);
+                    RefreshBoundaryList();
+                    StatusMessage = $"Outer boundary hard: {(boundary.OuterBoundary.IsHard ? "On" : "Off")}";
+                    return;
+                }
+                currentIndex++;
+            }
+
+            for (int i = 0; i < boundary.InnerBoundaries.Count; i++)
+            {
+                if (boundary.InnerBoundaries[i].IsValid)
+                {
+                    if (currentIndex == SelectedBoundaryIndex)
+                    {
+                        boundary.InnerBoundaries[i].IsHard = !boundary.InnerBoundaries[i].IsHard;
+                        _boundaryFileService.SaveBoundary(boundary, fieldPath);
+                        SetCurrentBoundary(boundary);
+                        RefreshBoundaryList();
+                        StatusMessage = $"Inner {i + 1} hard: {(boundary.InnerBoundaries[i].IsHard ? "On" : "Off")}";
                         return;
                     }
                     currentIndex++;

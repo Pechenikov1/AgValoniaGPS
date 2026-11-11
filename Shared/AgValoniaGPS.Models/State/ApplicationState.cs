@@ -44,13 +44,11 @@ public class ApplicationState : ObservableObject
     // Domain state objects
     public VehicleState Vehicle { get; } = new();
     public GuidanceState Guidance { get; } = new();
-    public SectionState Sections { get; } = new();
     public ConnectionState Connections { get; } = new();
     public FieldState Field { get; } = new();
     public YouTurnState YouTurn { get; } = new();
     public RecordedPathState RecordedPath { get; } = new();
     public BoundaryRecState BoundaryRec { get; } = new();
-    public SimulatorState Simulator { get; } = new();
     public UIState UI { get; } = new();
 
     // Global events
@@ -63,11 +61,9 @@ public class ApplicationState : ObservableObject
     {
         Vehicle.Reset();
         Guidance.Reset();
-        Sections.Reset();
         YouTurn.Reset();
         RecordedPath.Reset();
         BoundaryRec.Reset();
-        Simulator.Reset();
         // Field and Connections typically persist across field changes
         StateReset?.Invoke(this, EventArgs.Empty);
     }

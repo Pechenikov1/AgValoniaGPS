@@ -91,13 +91,13 @@ public partial class MainViewModel
     /// imperial). Used by the large speed slot in the top status strip.
     /// </summary>
     public double SpeedLargeValue =>
-        Models.Configuration.ConfigurationStore.Instance.IsMetric
+        _configStore.IsMetric
             ? SpeedKmh
             : SpeedKmh * 0.621371;
 
     /// <summary>Unit label that pairs with <see cref="SpeedLargeValue"/>.</summary>
     public string SpeedLargeUnit =>
-        Models.Configuration.ConfigurationStore.Instance.IsMetric ? "km/h" : "mph";
+        _configStore.IsMetric ? "km/h" : "mph";
 
     public int SatelliteCount
     {
@@ -145,13 +145,13 @@ public partial class MainViewModel
         // section control, coverage, boundary checks) on a background thread.
         // This handler only does lightweight UI-only work and user-action-driven recording.
 
-        if (Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+        if (_dispatcher.CheckAccess())
         {
             HandleGpsUiUpdates(data);
         }
         else
         {
-            Avalonia.Threading.Dispatcher.UIThread.Post(() => HandleGpsUiUpdates(data));
+            _dispatcher.Post(() => HandleGpsUiUpdates(data));
         }
     }
 
@@ -209,10 +209,10 @@ public partial class MainViewModel
         }
 
         // Log elevation data if enabled (#120)
-        if (Models.Configuration.ConfigurationStore.Instance.Display.ElevationLogEnabled && IsFieldOpen)
+        if (_configStore.Display.ElevationLogEnabled && IsFieldOpen)
         {
             _elevationLogService.IsEnabled = true;
-            var config = Models.Configuration.ConfigurationStore.Instance;
+            var config = _configStore;
             _elevationLogService.LogPoint(
                 data.CurrentPosition.Latitude, data.CurrentPosition.Longitude,
                 data.CurrentPosition.Altitude, config.Vehicle.AntennaHeight,
@@ -406,7 +406,7 @@ public partial class MainViewModel
         _gpsPipelineService.SetAutoSteerEngaged(_isAutoSteerEngaged);
         _gpsPipelineService.SetActiveTrack(track, pathsAway, nudgeOffset, isOnBoundary);
         _gpsPipelineService.SetBoundary(CurrentBoundary);
-        _gpsPipelineService.SetHeadlandLine(_currentHeadlandLine);
+        _gpsPipelineService.SetHeadlandLine(State.Field.HeadlandLine);
         _gpsPipelineService.SetDriftCompensation(State.Field.DriftEasting, State.Field.DriftNorthing);
         // Never arm U-turns on a closed/polygon track, regardless of the toggle (#421).
         _gpsPipelineService.SetYouTurnEnabled(IsYouTurnEnabled && !IsActiveTrackClosed);

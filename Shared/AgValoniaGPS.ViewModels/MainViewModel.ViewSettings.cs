@@ -151,7 +151,8 @@ public partial class MainViewModel
     private void InitializeClock()
     {
         CurrentTime = DateTime.Now.ToString("HH:mm:ss");
-        var clockTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        var clockTimer = _timerFactory.Create();
+        clockTimer.Interval = TimeSpan.FromSeconds(1);
         clockTimer.Tick += (_, _) => CurrentTime = DateTime.Now.ToString("HH:mm:ss");
         clockTimer.Start();
     }
@@ -336,15 +337,13 @@ public partial class MainViewModel
 
     #region Auto Day/Night
 
-    private DispatcherTimer? _autoDayNightTimer;
+    private AgValoniaGPS.Services.Interfaces.IUiTimer? _autoDayNightTimer;
 
     private void InitializeAutoDayNight()
     {
         CheckAutoDayNight();
-        _autoDayNightTimer = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromSeconds(60)
-        };
+        _autoDayNightTimer = _timerFactory.Create();
+        _autoDayNightTimer.Interval = TimeSpan.FromSeconds(60);
         _autoDayNightTimer.Tick += (_, _) => CheckAutoDayNight();
         _autoDayNightTimer.Start();
     }
@@ -356,7 +355,7 @@ public partial class MainViewModel
     /// </summary>
     private void CheckAutoDayNight()
     {
-        var display = ConfigurationStore.Instance.Display;
+        var display = _configStore.Display;
         if (!display.AutoDayNight) return;
         
         bool shouldBeDay = false;
@@ -390,12 +389,16 @@ public partial class MainViewModel
     #region ConfigurationStore Display Forwarding
 
     /// <summary>
-    /// UTurn button visible when track available AND config allows it AND the
-    /// active track isn't a closed loop (no U-turns on polygon tracks, #421).
+    /// Right-nav auto-U-turn controls (arm toggle + direction toggle) are available
+    /// when autosteer is available AND the active track isn't a closed loop (no
+    /// U-turns on polygon tracks, #421). Deliberately NOT gated by the
+    /// <see cref="DisplayConfig.UTurnButtonVisible"/> display-visibility preference:
+    /// that flag governs only the on-map U-turn overlay (<see cref="IsUTurnOverlayVisible"/>),
+    /// so hiding the overlay never makes arming/disarming auto-U-turn unreachable
+    /// (config/state audit §13.2).
     /// </summary>
     public bool IsUTurnButtonVisible =>
-        IsAutoSteerAvailable && ConfigurationStore.Instance.Display.UTurnButtonVisible
-        && !IsActiveTrackClosed;
+        IsAutoSteerAvailable && !IsActiveTrackClosed;
 
     /// <summary>
     /// Manual U-turn left/right buttons: visible only while steering AND not on a
@@ -409,7 +412,7 @@ public partial class MainViewModel
     /// "U-Turn" on-screen-button toggle (<see cref="DisplayConfig.UTurnButtonVisible"/>).
     /// </summary>
     public bool IsUTurnOverlayVisible =>
-        ConfigurationStore.Instance.Display.UTurnButtonVisible && IsManualUTurnVisible;
+        _configStore.Display.UTurnButtonVisible && IsManualUTurnVisible;
 
     /// <summary>
     /// On-map Lateral overlay (the two cyan shift arrows). Shown only while
@@ -418,7 +421,7 @@ public partial class MainViewModel
     /// (<see cref="DisplayConfig.LateralButtonVisible"/>) — previously orphaned.
     /// </summary>
     public bool IsLateralOverlayVisible =>
-        ConfigurationStore.Instance.Display.LateralButtonVisible && IsManualUTurnVisible;
+        _configStore.Display.LateralButtonVisible && IsManualUTurnVisible;
 
     /// <summary>
     /// Notify IsUTurnButtonVisible and the on-map overlay visibilities when their
@@ -443,7 +446,7 @@ public partial class MainViewModel
     {
         get
         {
-            var cfg = ConfigurationStore.Instance.Connections;
+            var cfg = _configStore.Connections;
             var st = State.Connections;
             int configured = 0;
             int present = 0;
@@ -496,12 +499,12 @@ public partial class MainViewModel
     /// </summary>
     public bool IsFieldStatsOnMapVisible
     {
-        get => ConfigurationStore.Instance.Display.FieldStatsOnMapVisible;
+        get => _configStore.Display.FieldStatsOnMapVisible;
         set
         {
-            if (ConfigurationStore.Instance.Display.FieldStatsOnMapVisible != value)
+            if (_configStore.Display.FieldStatsOnMapVisible != value)
             {
-                ConfigurationStore.Instance.Display.FieldStatsOnMapVisible = value;
+                _configStore.Display.FieldStatsOnMapVisible = value;
                 OnPropertyChanged();
                 _settingsService.Save();
             }
@@ -521,12 +524,12 @@ public partial class MainViewModel
     /// </summary>
     public bool IsGpsDetailOverlayVisible
     {
-        get => ConfigurationStore.Instance.Display.GpsDetailOverlayVisible;
+        get => _configStore.Display.GpsDetailOverlayVisible;
         set
         {
-            if (ConfigurationStore.Instance.Display.GpsDetailOverlayVisible != value)
+            if (_configStore.Display.GpsDetailOverlayVisible != value)
             {
-                ConfigurationStore.Instance.Display.GpsDetailOverlayVisible = value;
+                _configStore.Display.GpsDetailOverlayVisible = value;
                 OnPropertyChanged();
                 _settingsService.Save();
             }

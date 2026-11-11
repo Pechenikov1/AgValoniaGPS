@@ -23,6 +23,7 @@ using System.Reflection;
 using System.Windows.Input;
 using AgValoniaGPS.Models;
 using AgValoniaGPS.Models.Configuration;
+using AgValoniaGPS.Services.Interfaces;
 using AgValoniaGPS.Services.Logging;
 using Avalonia.Threading;
 using Microsoft.Extensions.Logging;
@@ -72,9 +73,16 @@ public partial class MainViewModel
                 "Are you sure you want to reset all settings to their defaults? This cannot be undone.",
                 () =>
                 {
+                    // Reset to defaults IN PLACE — persist the default DTO, then
+                    // reload it into the *existing* ConfigurationStore object.
+                    // Must not swap the store instance (SetInstance(new …)): every
+                    // service/VM now receives the store by injection and would be
+                    // left holding the old object. LoadAppSettings reapplies the
+                    // saved defaults into the same instance, preserving identity
+                    // and PropertyChanged subscriptions.
                     _settingsService.ResetToDefaults();
-                    ConfigurationStore.SetInstance(new ConfigurationStore());
                     _settingsService.Save();
+                    _configurationService.LoadAppSettings();
                     StatusMessage = "All settings reset to defaults. Restart recommended.";
                 });
         });
@@ -202,7 +210,7 @@ public partial class MainViewModel
                 catch { /* screenshot is optional */ }
 
                 var zipPath = Services.DebugDumpService.CreateDump(
-                    _settingsService, _appState, screenshotPng: screenshot);
+                    _settingsService, _appState, _configStore, screenshotPng: screenshot);
                 StatusMessage = $"Debug dump saved: {zipPath}";
                 _logger.LogInformation($"Debug dump created: {zipPath}");
             }
@@ -233,7 +241,7 @@ public partial class MainViewModel
             try
             {
                 _bugReportTempZipPath = Services.DebugDumpService.CreateDump(
-                    _settingsService, _appState, screenshotPng: _bugReportScreenshot);
+                    _settingsService, _appState, _configStore, screenshotPng: _bugReportScreenshot);
             }
             catch (Exception ex)
             {
@@ -295,7 +303,7 @@ public partial class MainViewModel
                 State.UI.IsBusy = true;
 
                 // Force UI to render busy overlay
-                await Dispatcher.UIThread.InvokeAsync(() => { }, Avalonia.Threading.DispatcherPriority.Render);
+                await _dispatcher.InvokeAsync(() => { }, UiDispatcherPriority.Render);
                 await System.Threading.Tasks.Task.Delay(50);
 
                 var bugReportsDir = Path.Combine(
@@ -339,6 +347,7 @@ public partial class MainViewModel
                     zipPath = Services.DebugDumpService.CreateDump(
                         _settingsService,
                         _appState,
+                        _configStore,
                         additionalNotes: notes,
                         screenshotPng: _bugReportScreenshot,
                         outputDirectory: bugReportsDir,
@@ -486,7 +495,7 @@ public partial class MainViewModel
 
     private void OnLogStoreUpdated()
     {
-        Dispatcher.UIThread.Post(RefreshLogEntries);
+        _dispatcher.Post(RefreshLogEntries);
     }
 
     private void RefreshLogEntries()
@@ -557,7 +566,7 @@ public partial class MainViewModel
             return;
         }
 
-        if (_fieldOriginLatitude == 0 && _fieldOriginLongitude == 0 &&
+        if (State.Field.OriginLatitude == 0 && State.Field.OriginLongitude == 0 &&
             Latitude == 0 && Longitude == 0)
         {
             FlagByLatLonError = "No field or GPS origin available";
@@ -565,8 +574,8 @@ public partial class MainViewModel
         }
 
         // Use field origin if available, else current GPS position as origin
-        double originLat = _fieldOriginLatitude != 0 ? _fieldOriginLatitude : Latitude;
-        double originLon = _fieldOriginLongitude != 0 ? _fieldOriginLongitude : Longitude;
+        double originLat = State.Field.OriginLatitude != 0 ? State.Field.OriginLatitude : Latitude;
+        double originLon = State.Field.OriginLongitude != 0 ? State.Field.OriginLongitude : Longitude;
 
         var converter = new Models.Base.GeoConversion(originLat, originLon);
         var local = converter.ToLocal(lat, lon);
@@ -594,7 +603,7 @@ public partial class MainViewModel
     private void RefreshSettingsTree()
     {
         SettingsTree.Clear();
-        var store = ConfigurationStore.Instance;
+        var store = _configStore;
 
         AddConfigGroup("Vehicle", store.Vehicle);
         AddConfigGroup("Tool", store.Tool);

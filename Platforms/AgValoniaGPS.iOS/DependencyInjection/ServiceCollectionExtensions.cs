@@ -36,6 +36,7 @@ using AgValoniaGPS.Models.Pipeline;
 using AgValoniaGPS.Models.State;
 using AgValoniaGPS.iOS.Services;
 using AgValoniaGPS.Services.Logging;
+using AgValoniaGPS.Views.Infrastructure;
 
 namespace AgValoniaGPS.iOS.DependencyInjection;
 
@@ -54,13 +55,23 @@ public static class ServiceCollectionExtensions
 
         // Centralized application state (single source of truth)
         services.AddSingleton<ApplicationState>();           // ephemeral, in-memory only
+        services.AddSingleton(_ => AgValoniaGPS.Models.Configuration.ConfigurationStore.Instance); // config SoT; same object as .Instance (Views/tests use the static seam)
         services.AddSingleton(_ => PersistentAppState.Instance); // persisted to appstate.json (same object as .Instance)
+
+        // UI-thread dispatcher abstraction (replaces direct Dispatcher.UIThread
+        // in the VM layer — see Plans/CONFIG_STATE_AUDIT.md §11).
+        services.AddSingleton<IUiDispatcher, AvaloniaUiDispatcher>();
+
+        // UI-thread timer abstraction (replaces direct DispatcherTimer in the
+        // VM layer — see Plans/CONFIG_STATE_AUDIT.md §11.3).
+        services.AddSingleton<IUiTimerFactory, AvaloniaUiTimerFactory>();
 
         // Register ViewModels
         services.AddTransient<MainViewModel>();
         services.AddTransient<ConfigurationViewModel>();
 
         // Register Services
+        services.AddSingleton<ILocalNetworkInfoProvider, SystemLocalNetworkInfoProvider>();
         services.AddSingleton<IUdpCommunicationService, UdpCommunicationService>();
 
         // Core services

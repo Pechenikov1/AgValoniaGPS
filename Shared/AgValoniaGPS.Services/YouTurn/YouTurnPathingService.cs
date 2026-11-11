@@ -45,10 +45,12 @@ namespace AgValoniaGPS.Services.YouTurn;
 public sealed class YouTurnPathingService
 {
     private readonly ILogger<YouTurnPathingService> _logger;
+    private readonly ConfigurationStore _configStore;
 
-    public YouTurnPathingService(ILogger<YouTurnPathingService> logger)
+    public YouTurnPathingService(ILogger<YouTurnPathingService> logger, ConfigurationStore configStore)
     {
         _logger = logger;
+        _configStore = configStore;
     }
 
     /// <summary>
@@ -68,7 +70,7 @@ public sealed class YouTurnPathingService
 
         var refPointA = referenceTrack.Points[0];
         var refPointB = referenceTrack.Points[referenceTrack.Points.Count - 1];
-        var config = ConfigurationStore.Instance;
+        var config = _configStore;
 
         // Offset direction via XOR of turn direction and travel direction:
         //   turnLeft=true,  sameWay=true  -> negative
@@ -88,7 +90,9 @@ public sealed class YouTurnPathingService
         int nextPathsAway = guidance.HowManyPathsAway + offsetChange;
 
         double widthMinusOverlap = config.ActualToolWidth - config.Tool.Overlap;
-        double nextDistAway = widthMinusOverlap * nextPathsAway;
+        // Include the nudge so the cyan next-track line matches the U-turn exit leg and the
+        // line the tractor steers after completion exactly (all use base*pathsAway + nudge).
+        double nextDistAway = widthMinusOverlap * nextPathsAway + guidance.NudgeOffset;
 
         // Authoritative perpendicular width for the U-turn arc — direction lives in IsTurnLeft.
         turn.NextTrackTurnOffset = Math.Abs(pathsToMove * widthMinusOverlap);
@@ -107,7 +111,13 @@ public sealed class YouTurnPathingService
         }
         else
         {
-            var offsetPoints = CurveProcessing.CreateOffsetCurve(referenceTrack.Points, nextDistAway);
+            // Offset then EXTEND the ends — same order as the U-turn exit leg
+            // (BuildNewOffsetCurveList) and the post-turn active line — so the cyan
+            // next-track curve reaches the exit leg's end (no gap) and is the same
+            // length as the magenta line that replaces it after the turn completes.
+            // ExtendCurveEnds is a no-op on closed loops.
+            var offsetPoints = CurveProcessing.ExtendCurveEnds(
+                CurveProcessing.CreateOffsetCurve(referenceTrack.Points, nextDistAway));
             nextTrack = Models.Track.Track.FromCurve($"Path {nextPathsAway}", offsetPoints, referenceTrack.IsClosed);
         }
         nextTrack.IsActive = false;
@@ -152,7 +162,7 @@ public sealed class YouTurnPathingService
         if (currentTrack.Points.Count < 2)
             return (true, false);
 
-        var config = ConfigurationStore.Instance;
+        var config = _configStore;
         int pathsToMove = uTurnSkipRows + 1;
         int nextPathsAwayNeg = guidance.HowManyPathsAway - pathsToMove;
         int nextPathsAwayPos = guidance.HowManyPathsAway + pathsToMove;
@@ -242,7 +252,7 @@ public sealed class YouTurnPathingService
         Boundary? boundary,
         IReadOnlyList<Vec3>? headlandLine)
     {
-        var config = ConfigurationStore.Instance;
+        var config = _configStore;
         double widthMinusOverlap = config.ActualToolWidth - config.Tool.Overlap;
         if (widthMinusOverlap < 0.5) return;
 
